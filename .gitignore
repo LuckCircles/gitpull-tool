@@ -8,3 +8,46 @@ wheels/
 
 # Virtual environments
 .venv
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Nuitka outputs
+releases/
+*.exe
+*.msi
+
+# Logs and databases
+*.log
+*.sql
+*.sqlite
+
+# Config files (if contains sensitive info)
+config.json
+.env
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+venv/
+env/
+ENV/
+
+# Binary and config files
+*.exe
+*.msi
+config.json
+*.log
