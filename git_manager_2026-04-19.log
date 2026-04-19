@@ -1,0 +1,49 @@
+2026-04-19 15:53:38.128 | SUCCESS  | __main__:__init__:280 - Git 多仓库管理器启动成功
+2026-04-19 15:59:03.321 | SUCCESS  | __main__:__init__:306 - Git 多仓库管理器启动成功
+2026-04-19 15:59:21.282 | WARNING  | __main__:clone_repo:582 - 克隆跳过，目录已存在: C:\Users\luck\Desktop\23\ChatLab
+2026-04-19 15:59:24.367 | INFO     | __main__:scan_repos:505 - 开始扫描目录: C:\Users\luck\Desktop\23
+2026-04-19 15:59:32.128 | INFO     | __main__:select_folder:490 - 切换目录 → C:/Users/luck/Desktop/23/ChatLab
+2026-04-19 15:59:32.958 | INFO     | __main__:scan_repos:505 - 开始扫描目录: C:/Users/luck/Desktop/23/ChatLab
+2026-04-19 15:59:48.805 | ERROR    | __main__:delete_selected_repo:565 - 删除仓库失败: 'PermissionError' object is not subscriptable
+2026-04-19 16:00:02.850 | INFO     | __main__:select_folder:490 - 切换目录 → C:/Users/luck/Desktop/23
+2026-04-19 16:00:04.631 | INFO     | __main__:scan_repos:505 - 开始扫描目录: C:/Users/luck/Desktop/23
+2026-04-19 16:00:17.607 | INFO     | __main__:scan_repos:505 - 开始扫描目录: C:/Users/luck/Desktop/23
+2026-04-19 16:00:34.832 | INFO     | __main__:select_folder:490 - 切换目录 → D:/Github
+2026-04-19 16:00:36.350 | INFO     | __main__:scan_repos:505 - 开始扫描目录: D:/Github
+2026-04-19 16:04:04.976 | SUCCESS  | __main__:__init__:306 - Git 多仓库管理器启动成功
+2026-04-19 16:04:31.909 | INFO     | __main__:clone_repo:586 - [克隆] git clone https://ghfast.top/https://github.com/zhiyiYo/PyQt-Fluent-Widgets.git
+2026-04-19 16:04:32.048 | ERROR    | __main__:clone_repo:594 - 仓库克隆失败
+Cloning into 'PyQt-Fluent-Widgets'...
+fatal: protocol 'git clone https' is not supported
+2026-04-19 16:05:56.113 | SUCCESS  | __main__:__init__:346 - Git 多仓库管理器启动成功
+2026-04-19 16:06:41.670 | SUCCESS  | __main__:__init__:346 - Git 多仓库管理器启动成功
+2026-04-19 16:07:06.906 | INFO     | __main__:clone_repo:626 - [克隆] https://github.com/zhiyiYo/PyQt-Fluent-Widgets.git
+2026-04-19 16:07:12.156 | ERROR    | __main__:clone_repo:634 - 仓库克隆失败
+Cloning into 'PyQt-Fluent-Widgets'...
+fatal: unable to access 'https://github.com/zhiyiYo/PyQt-Fluent-Widgets.git/': TLS connect error: error:0A000126:SSL routines::unexpected eof while reading
+2026-04-19 16:20:06.909 | SUCCESS  | __main__:__init__:428 - Git 多仓库管理器启动成功
+2026-04-19 16:20:09.762 | INFO     | __main__:scan_repos:627 - 开始扫描目录: C:\Users\luck\Desktop\23
+2026-04-19 16:27:08.338 | SUCCESS  | __main__:__init__:480 - Git 多仓库管理器启动成功
+2026-04-19 16:27:11.528 | INFO     | __main__:scan_repos:679 - 开始扫描目录: C:\Users\luck\Desktop\23
+2026-04-19 16:27:44.740 | ERROR    | __main__:delete_selected_repo:750 - 删除仓库失败: 'PermissionError' object is not subscriptable
+2026-04-19 16:28:47.633 | SUCCESS  | __main__:__init__:480 - Git 多仓库管理器启动成功
+2026-04-19 16:28:49.355 | INFO     | __main__:scan_repos:679 - 开始扫描目录: C:\Users\luck\Desktop\23
+2026-04-19 16:29:03.665 | ERROR    | __main__:delete_selected_repo:750 - 删除仓库失败: 'PermissionError' object is not subscriptable
+2026-04-19 16:29:18.450 | INFO     | __main__:select_folder:664 - 切换目录 → D:/Github
+2026-04-19 16:29:21.387 | INFO     | __main__:scan_repos:679 - 开始扫描目录: D:/Github
+2026-04-19 16:38:27.963 | SUCCESS  | __main__:__init__:482 - Git 多仓库管理器启动成功
+2026-04-19 16:38:31.520 | INFO     | __main__:scan_repos:681 - 开始扫描目录: C:\Users\luck\Desktop\23
+2026-04-19 16:38:40.801 | ERROR    | __main__:delete_selected_repo:749 - 删除仓库失败: 'PermissionError' object is not subscriptable
+2026-04-19 16:39:08.028 | INFO     | __main__:select_folder:666 - 切换目录 → D:/Github
+2026-04-19 16:39:11.136 | INFO     | __main__:scan_repos:681 - 开始扫描目录: D:/Github
+2026-04-19 16:40:35.984 | SUCCESS  | __main__:__init__:482 - Git 多仓库管理器启动成功
+2026-04-19 16:43:42.302 | SUCCESS  | __main__:__init__:484 - Git 多仓库管理器启动成功
+2026-04-19 16:43:52.951 | INFO     | __main__:select_folder:693 - 切换目录 → D:/Github
+2026-04-19 16:44:11.381 | SUCCESS  | __main__:__init__:484 - Git 多仓库管理器启动成功
+2026-04-19 16:44:19.174 | INFO     | __main__:select_folder:693 - 切换目录 → C:/Users/luck/Desktop/23
+2026-04-19 16:44:21.671 | INFO     | __main__:scan_repos:708 - 开始扫描目录: C:/Users/luck/Desktop/23
+2026-04-19 16:44:29.575 | SUCCESS  | __main__:apply_proxy:699 - 代理已设置: http://127.0.0.1:7897
+2026-04-19 16:45:05.464 | INFO     | __main__:clone_git_repo:832 - [克隆] 尝试源: https://github.com/hellodigua/ChatLab.git
+2026-04-19 16:45:09.349 | SUCCESS  | __main__:clone_repo:798 - 仓库克隆成功: C:\Users\luck\Desktop\23\ChatLab
+2026-04-19 16:45:09.357 | INFO     | __main__:scan_repos:708 - 开始扫描目录: C:/Users/luck/Desktop/23
+2026-04-19 16:45:42.922 | ERROR    | __main__:delete_selected_repo:776 - 删除仓库失败: 'PermissionError' object is not subscriptable
