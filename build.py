@@ -26,7 +26,7 @@ def compile_with_nuitka():
         "--enable-plugins=pyside6",
         "--windows-icon-from-ico=icon.ico",
         "--onefile",
-         f"--output-filename=GitPull-tool",
+        "--output-filename=GitPull-tool",
         # f"--file-version={VERSION}",
         "--warn-implicit-exceptions",
         "--assume-yes-for-downloads",
