@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 )
 from qfluentwidgets import (
     BodyLabel,
+    CaptionLabel,
     HorizontalSeparator,
     InfoBar,
     LineEdit,
@@ -404,6 +405,9 @@ class InputSettingCard(SettingCard):
     def set_read_only(self, read_only: bool):
         self.line_edit.setReadOnly(read_only)
 
+    def set_placeholder_text(self, text: str):
+        self.line_edit.setPlaceholderText(text)
+
 
 class QtLogHandler(QObject):
     log_signal = Signal(str)
@@ -708,6 +712,7 @@ class GitManager(MSFluentWindow):
         self.setWindowIcon(QIcon(":/icon.ico"))
         self.resize(1280, 800)
 
+        self._config_cache = self._load_cached_config()
         self.base_dir = self.load_base_dir()
         self.repos: list[str] = []
         self.executor = ThreadPoolExecutor(max_workers=6)
@@ -723,6 +728,12 @@ class GitManager(MSFluentWindow):
             self.qt_handler.write, level="DEBUG", format="{time:HH:mm:ss} | <level>{level:8}</level> | {message}"
         )
         logger.success("Git 多仓库管理器启动成功")
+
+    def _load_cached_config(self) -> dict:
+        return load_config()
+
+    def _save_cached_config(self):
+        save_config(self._config_cache)
 
     def closeEvent(self, event):
         self._is_closing = True
@@ -743,7 +754,7 @@ class GitManager(MSFluentWindow):
     def load_base_dir(self) -> str:
         default_dir = os.getcwd()
         try:
-            config = load_config()
+            config = self._config_cache
             saved_dir = str(config.get("base_dir") or "").strip()
             if saved_dir and os.path.isdir(saved_dir):
                 return saved_dir
@@ -753,27 +764,25 @@ class GitManager(MSFluentWindow):
         return default_dir
 
     def load_proxy(self) -> str:
-        config = load_config()
+        config = self._config_cache
         return str(config.get("proxy") or "http://127.0.0.1:7897").strip()
 
     def load_token(self) -> str:
-        config = load_config()
+        config = self._config_cache
         return str(config.get("token") or "").strip()
 
     def save_base_dir(self):
         try:
-            config = load_config()
-            config["base_dir"] = self.base_dir
-            save_config(config)
+            self._config_cache["base_dir"] = self.base_dir
+            self._save_cached_config()
         except Exception as e:
             logger.warning(f"保存配置失败: {str(e)}")
 
     def save_settings(self, base_dir: str, proxy: str, token: str):
-        config = load_config()
-        config["base_dir"] = base_dir
-        config["proxy"] = proxy
-        config["token"] = token
-        save_config(config)
+        self._config_cache["base_dir"] = base_dir
+        self._config_cache["proxy"] = proxy
+        self._config_cache["token"] = token
+        self._save_cached_config()
 
     def init_ui(self):
         self.repo_page = QWidget()
@@ -840,6 +849,8 @@ class GitManager(MSFluentWindow):
         settings_layout.setSpacing(12)
 
         self.settings_group = SettingCardGroup("应用设置", self.settings_page)
+        self.settings_group.setFixedHeight(340)
+        self.settings_tips = CaptionLabel("建议：目录设置完成后点击“保存”以立即写入配置并应用代理。", self.settings_page)
 
         self.dir_card = InputSettingCard(FIF.FOLDER, "目录", "仓库存放目录", "选择", self.settings_group)
         self.dir_card.set_text(self.base_dir)
@@ -848,10 +859,12 @@ class GitManager(MSFluentWindow):
         self.settings_group.addSettingCard(self.dir_card)
 
         self.proxy_card = InputSettingCard(FIF.GLOBE, "代理", "Git 全局 HTTP 代理", parent=self.settings_group)
+        self.proxy_card.set_placeholder_text("例如: http://127.0.0.1:7897")
         self.proxy_card.set_text(self.load_proxy())
         self.settings_group.addSettingCard(self.proxy_card)
 
         self.token_card = InputSettingCard(FIF.SETTING, "Token", "预留字段（可选）", parent=self.settings_group)
+        self.token_card.set_placeholder_text("可留空")
         self.token_card.set_text(self.load_token())
         self.settings_group.addSettingCard(self.token_card)
 
@@ -862,6 +875,7 @@ class GitManager(MSFluentWindow):
         self.settings_group.addSettingCard(self.save_card)
 
         settings_layout.addWidget(self.settings_group)
+        settings_layout.addWidget(self.settings_tips)
         settings_layout.addStretch(1)
 
         self.addSubInterface(self.repo_page, FIF.HOME, "仓库")
