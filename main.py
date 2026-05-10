@@ -7,24 +7,12 @@ import stat
 import subprocess
 import sys
 import threading
-import time
-import urllib.error
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 
-from github_release_downloader import (
-    AuthSession,
-    GitHubRepo as DownloaderGitHubRepo,
-    ReleaseAsset as DownloaderReleaseAsset,
-    download_asset as downloader_download_asset,
-    get_assets as downloader_get_assets,
-    get_available_versions as downloader_get_available_versions,
-)
 from loguru import logger
-from semantic_version import Version
 from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QTextCursor
 from PySide6.QtWidgets import (
@@ -33,10 +21,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
-    QLineEdit,
-    QMainWindow,
     QMessageBox,
-    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -58,6 +43,9 @@ from qfluentwidgets import (
     TextEdit,
     Theme,
     ToolButton,
+    MSFluentWindow,
+    SettingCardGroup,
+    SettingCard,
     setTheme,
 )
 from qfluentwidgets import FluentIcon as FIF
@@ -65,11 +53,20 @@ from qfluentwidgets import FluentIcon as FIF
 from res_rc import qInitResources
 
 logger.remove()
-logger.add("git_manager_{time:YYYY-MM-DD}.log", rotation="10 MB", retention="7 days", encoding="utf-8")
-CONFIG_FILE = Path(__file__).with_name("config.json")
-RELEASE_CACHE_FILE = Path(__file__).with_name("release_cache.json")
+
+
+def get_app_data_dir() -> Path:
+    try:
+        exe_path = Path(sys.argv[0]).resolve()
+        return exe_path.parent
+    except Exception:
+        return Path.cwd()
+
+
+APP_DATA_DIR = get_app_data_dir()
+CONFIG_FILE = APP_DATA_DIR / "config.json"
+logger.add(str(APP_DATA_DIR / "git_manager_{time:YYYY-MM-DD}.log"), rotation="10 MB", retention="7 days", encoding="utf-8")
 MAX_DIFF_BYTES = 1024 * 1024
-RELEASE_CACHE_TTL_SECONDS = 15 * 60
 
 
 def load_config() -> dict:
@@ -92,99 +89,6 @@ def save_config(config: dict):
         logger.warning(f"保存配置失败: {str(e)}")
 
 
-def saved_github_token() -> str:
-    return str(load_config().get("github_token") or "").strip()
-
-
-class RateLimiter:
-    def __init__(self, min_interval_seconds: float = 1.0):
-        self.min_interval_seconds = min_interval_seconds
-        self._lock = threading.Lock()
-        self._next_allowed: dict[str, float] = {}
-
-    def wait(self, key: str):
-        with self._lock:
-            now = time.monotonic()
-            next_allowed = self._next_allowed.get(key, now)
-            delay = max(0.0, next_allowed - now)
-            self._next_allowed[key] = max(now, next_allowed) + self.min_interval_seconds
-
-        if delay:
-            time.sleep(delay)
-
-
-class ReleaseCache:
-    def __init__(self, filename: Path = RELEASE_CACHE_FILE, ttl_seconds: int = RELEASE_CACHE_TTL_SECONDS):
-        self.filename = filename
-        self.ttl_seconds = ttl_seconds
-        self._lock = threading.Lock()
-
-    @staticmethod
-    def key(source: "ReleaseSource") -> str:
-        return f"{source.host}/{source.owner}/{source.repo}"
-
-    def get(self, source: "ReleaseSource") -> list[dict] | None:
-        with self._lock:
-            cache = self._load()
-            entry = cache.get(self.key(source))
-            if not entry:
-                return None
-
-            if time.time() - float(entry.get("saved_at") or 0) > self.ttl_seconds:
-                return None
-
-            releases = entry.get("releases")
-            if not isinstance(releases, list):
-                return None
-
-            return [self._from_cache_release(item) for item in releases if isinstance(item, dict)]
-
-    def set(self, source: "ReleaseSource", releases: list[dict]):
-        with self._lock:
-            cache = self._load()
-            cache[self.key(source)] = {
-                "saved_at": time.time(),
-                "releases": [self._to_cache_release(release) for release in releases],
-            }
-            self._save(cache)
-
-    def _load(self) -> dict:
-        try:
-            if not self.filename.exists():
-                return {}
-            with self.filename.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except Exception as e:
-            logger.warning(f"加载 Release 缓存失败: {str(e)}")
-            return {}
-
-    def _save(self, cache: dict):
-        try:
-            with self.filename.open("w", encoding="utf-8") as f:
-                json.dump(cache, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.warning(f"保存 Release 缓存失败: {str(e)}")
-
-    @staticmethod
-    def _to_cache_release(release: dict) -> dict:
-        cached = dict(release)
-        source = cached.get("source")
-        if isinstance(source, ReleaseSource):
-            cached["source"] = source.__dict__
-        return cached
-
-    @staticmethod
-    def _from_cache_release(release: dict) -> dict:
-        cached = dict(release)
-        source = cached.get("source")
-        if isinstance(source, dict):
-            cached["source"] = ReleaseSource(**source)
-        return cached
-
-
-release_rate_limiter = RateLimiter()
-release_cache = ReleaseCache()
 
 
 def build_hidden_subprocess_kwargs() -> dict:
@@ -216,14 +120,6 @@ class GitRepoCandidate:
     path: str
     is_git: bool
     git_path: str
-
-
-@dataclass
-class ReleaseSource:
-    host: str
-    owner: str
-    repo: str
-    api_url: str
 
 
 def derive_repo_name(repo_input: str | GitRepoInfo) -> str:
@@ -262,48 +158,6 @@ def build_clone_candidates(repo_input: str | GitRepoInfo) -> list[str]:
     return unique_candidates
 
 
-def parse_release_source(remote_url: str) -> ReleaseSource | None:
-    url = remote_url.strip()
-    if not url:
-        return None
-
-    if url.startswith("git@") and ":" in url:
-        host_part, path_part = url[4:].split(":", 1)
-        host = host_part.lower()
-        path = path_part
-    else:
-        parsed = urlparse(url)
-        host = parsed.netloc.lower()
-        if "@" in host:
-            host = host.rsplit("@", 1)[1]
-        path = parsed.path.lstrip("/")
-
-    if host.startswith("www."):
-        host = host[4:]
-
-    if path.endswith(".git"):
-        path = path[:-4]
-    path = path.strip("/")
-    parts = [part for part in path.split("/") if part]
-    if len(parts) < 2:
-        return None
-
-    owner = parts[0]
-    repo = parts[1]
-
-    if host == "github.com":
-        api_url = f"https://api.github.com/repos/{owner}/{repo}/releases"
-    elif host == "gitee.com":
-        api_url = f"https://gitee.com/api/v5/repos/{owner}/{repo}/releases"
-    elif host == "gitlab.com":
-        project = quote(f"{owner}/{repo}", safe="")
-        api_url = f"https://gitlab.com/api/v4/projects/{project}/releases"
-    else:
-        return None
-
-    return ReleaseSource(host=host, owner=owner, repo=repo, api_url=api_url)
-
-
 def human_file_size(size: int | str | None) -> str:
     try:
         value = float(size or 0)
@@ -318,27 +172,6 @@ def human_file_size(size: int | str | None) -> str:
     return "N/A"
 
 
-def release_total_size(release: dict) -> int | None:
-    total = 0
-    has_size = False
-    for asset in release.get("assets") or []:
-        try:
-            total += int(asset.get("size") or 0)
-            has_size = True
-        except (TypeError, ValueError):
-            continue
-    return total if has_size else None
-
-
-def format_release_summary(release: dict) -> str:
-    return release.get("tag") or release.get("name") or "Release"
-
-
-def sanitize_download_filename(name: str) -> str:
-    filename = os.path.basename(name).strip() or "release-asset"
-    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", filename).strip(". ") or "release-asset"
-
-
 def limit_text_bytes(text: str, max_bytes: int = MAX_DIFF_BYTES) -> tuple[str, bool]:
     encoded = text.encode("utf-8", errors="replace")
     if len(encoded) <= max_bytes:
@@ -349,179 +182,6 @@ def limit_text_bytes(text: str, max_bytes: int = MAX_DIFF_BYTES) -> tuple[str, b
     content_limit = max(0, max_bytes - len(notice_bytes))
     limited = encoded[:content_limit].decode("utf-8", errors="ignore")
     return limited + notice, True
-
-
-def normalize_release(raw: dict, source: ReleaseSource) -> dict:
-    tag = raw.get("tag_name") or raw.get("tagName") or raw.get("tag") or ""
-    name = raw.get("name") or tag or "未命名 Release"
-    published_at = (
-        raw.get("published_at") or raw.get("released_at") or raw.get("created_at") or raw.get("updated_at") or ""
-    )
-    body = raw.get("body") or raw.get("description") or ""
-    html_url = raw.get("html_url") or raw.get("_links", {}).get("self") or raw.get("url") or ""
-
-    assets = []
-    raw_assets = raw.get("assets") or []
-    asset_items = raw_assets if isinstance(raw_assets, list) else []
-    for asset in asset_items:
-        download_url = (
-            asset.get("browser_download_url")
-            or asset.get("direct_asset_url")
-            or asset.get("url")
-            or asset.get("download_url")
-        )
-        if not download_url:
-            continue
-        asset_name = asset.get("name") or os.path.basename(urlparse(download_url).path) or "release-asset"
-        assets.append(
-            {
-                "name": asset_name,
-                "size": asset.get("size"),
-                "url": download_url,
-            }
-        )
-
-    gitlab_links = ((raw.get("assets") or {}).get("links") or []) if isinstance(raw.get("assets"), dict) else []
-    for link in gitlab_links:
-        download_url = link.get("direct_asset_url") or link.get("url")
-        if not download_url:
-            continue
-        assets.append(
-            {
-                "name": link.get("name") or os.path.basename(urlparse(download_url).path) or "release-asset",
-                "size": link.get("size"),
-                "url": download_url,
-            }
-        )
-
-    for key, label in (("zipball_url", "Source code (zip)"), ("tarball_url", "Source code (tar.gz)")):
-        if raw.get(key):
-            assets.append({"name": f"{tag or name} - {label}", "size": None, "url": raw[key]})
-
-    for source_item in raw.get("sources") or []:
-        download_url = source_item.get("url")
-        if not download_url:
-            continue
-        assets.append(
-            {
-                "name": source_item.get("format") or os.path.basename(urlparse(download_url).path) or "source",
-                "size": None,
-                "url": download_url,
-            }
-        )
-
-    return {
-        "tag": tag,
-        "name": name,
-        "published_at": published_at,
-        "body": body,
-        "html_url": html_url,
-        "source": source,
-        "assets": assets,
-    }
-
-
-def build_release_request_headers(binary: bool = False) -> dict:
-    headers = {
-        "Accept": "application/octet-stream" if binary else "application/json",
-        "User-Agent": "GitManager/1.0",
-    }
-    token = github_token()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return headers
-
-
-def github_token() -> str:
-    return os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or saved_github_token()
-
-
-def sync_github_downloader_auth(token: str):
-    AuthSession.header = {"Authorization": f"Bearer {token}"} if token else {}
-
-
-def parse_github_release_tag(tag_name: str) -> Version:
-    cleaned = tag_name.strip().lstrip("vV")
-    match = re.search(r"\d+(?:\.\d+){0,2}", cleaned)
-    if not match:
-        return Version("0.0.0")
-
-    parts = match.group(0).split(".")
-    while len(parts) < 3:
-        parts.append("0")
-
-    return Version(".".join(parts[:3]))
-
-
-def classify_release_error(status_code: int | None = None, detail: str = "", exc: Exception | None = None) -> str:
-    if status_code in (401, 403):
-        if "rate limit" in detail.lower():
-            return "限流"
-        return "认证"
-    if status_code == 404:
-        return "不存在"
-    if status_code and status_code >= 500:
-        return "服务端"
-    if isinstance(exc, urllib.error.URLError):
-        return "网络"
-    if "Invalid version string" in detail:
-        return "版本解析"
-    return "未知"
-
-
-def build_tag_release_fallback(source: ReleaseSource, tag: str) -> dict:
-    if source.host == "github.com":
-        html_url = f"https://github.com/{source.owner}/{source.repo}/releases/tag/{tag}"
-        assets = [
-            {
-                "name": f"{tag} - Source code (zip)",
-                "size": None,
-                "url": f"https://github.com/{source.owner}/{source.repo}/archive/refs/tags/{tag}.zip",
-            },
-            {
-                "name": f"{tag} - Source code (tar.gz)",
-                "size": None,
-                "url": f"https://github.com/{source.owner}/{source.repo}/archive/refs/tags/{tag}.tar.gz",
-            },
-        ]
-    elif source.host == "gitee.com":
-        html_url = f"https://gitee.com/{source.owner}/{source.repo}/releases/tag/{tag}"
-        assets = [
-            {
-                "name": f"{tag} - Source code (zip)",
-                "size": None,
-                "url": f"https://gitee.com/{source.owner}/{source.repo}/repository/archive/{tag}.zip",
-            },
-            {
-                "name": f"{tag} - Source code (tar.gz)",
-                "size": None,
-                "url": f"https://gitee.com/{source.owner}/{source.repo}/repository/archive/{tag}.tar.gz",
-            },
-        ]
-    else:
-        html_url = f"https://gitlab.com/{source.owner}/{source.repo}/-/releases/{tag}"
-        assets = [
-            {
-                "name": f"{tag} - Source code (zip)",
-                "size": None,
-                "url": f"https://gitlab.com/{source.owner}/{source.repo}/-/archive/{tag}/{source.repo}-{tag}.zip",
-            },
-            {
-                "name": f"{tag} - Source code (tar.gz)",
-                "size": None,
-                "url": f"https://gitlab.com/{source.owner}/{source.repo}/-/archive/{tag}/{source.repo}-{tag}.tar.gz",
-            },
-        ]
-
-    return {
-        "tag": tag,
-        "name": tag,
-        "published_at": "API 不可用，来自远程 tag",
-        "body": "Release API 查询失败，已退回到远程 tag 列表。此模式只能下载源码包，无法显示 Release 附件和正文。",
-        "html_url": html_url,
-        "source": source,
-        "assets": assets,
-    }
 
 
 def safe_remove_repo_dir(base_path: str, repo_name: str, onexc=None) -> dict:
@@ -720,6 +380,29 @@ class CloneRepoDialog(MessageBoxBase):
             re.IGNORECASE,
         )
         return bool(pattern.match(url))
+
+
+class InputSettingCard(SettingCard):
+    def __init__(self, icon, title: str, content: str = "", button_text: str | None = None, parent=None):
+        super().__init__(icon, title, content, parent)
+        self.line_edit = LineEdit(self)
+        self.line_edit.setClearButtonEnabled(True)
+        self.hBoxLayout.addWidget(self.line_edit, 1, Qt.AlignRight)
+
+        self.button = None
+        if button_text:
+            self.button = PushButton(button_text, self)
+            self.hBoxLayout.addSpacing(8)
+            self.hBoxLayout.addWidget(self.button, 0, Qt.AlignRight)
+
+    def text(self) -> str:
+        return self.line_edit.text().strip()
+
+    def set_text(self, text: str):
+        self.line_edit.setText(text)
+
+    def set_read_only(self, read_only: bool):
+        self.line_edit.setReadOnly(read_only)
 
 
 class QtLogHandler(QObject):
@@ -1009,170 +692,9 @@ class BranchDialog(QDialog):
             self.parent().switch_to_branch(self.repo_path, branch_info, self)
 
 
-# ====================== Release 信息弹窗 ======================
-class ReleaseDialog(QDialog):
-    def __init__(self, repo_path: str, parent=None):
-        super().__init__(parent)
-        self.repo_path = repo_path
-        self.releases: list[dict] = []
-        self.current_assets: list[dict] = []
-        self.setWindowTitle(f"Release - {os.path.basename(repo_path)}")
-        self.resize(1040, 700)
-
-        layout = QVBoxLayout(self)
-        layout.setSpacing(12)
-        layout.setContentsMargins(16, 16, 16, 16)
-
-        layout.addWidget(StrongBodyLabel(f"仓库: {repo_path}"))
-
-        splitter = QSplitter(Qt.Vertical)
-
-        self.release_table = TableWidget()
-        self.release_table.setColumnCount(2)
-        self.release_table.setHorizontalHeaderLabels(["发布版本号", "大小"])
-        self.release_table.verticalHeader().setVisible(False)
-        self.release_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.release_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.release_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.release_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.release_table.itemSelectionChanged.connect(self.update_release_detail)
-        splitter.addWidget(self.release_table)
-
-        detail_widget = QWidget()
-        detail_layout = QVBoxLayout(detail_widget)
-        detail_layout.setContentsMargins(0, 0, 0, 0)
-        detail_layout.setSpacing(8)
-
-        detail_layout.addWidget(StrongBodyLabel("Release 信息"))
-        self.detail_text = TextEdit()
-        self.detail_text.setReadOnly(True)
-        detail_layout.addWidget(self.detail_text, 2)
-
-        detail_layout.addWidget(StrongBodyLabel("可下载资源"))
-        self.asset_table = TableWidget()
-        self.asset_table.setColumnCount(3)
-        self.asset_table.setHorizontalHeaderLabels(["文件", "大小", "地址"])
-        self.asset_table.verticalHeader().setVisible(False)
-        self.asset_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.asset_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.asset_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self.asset_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.asset_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        detail_layout.addWidget(self.asset_table, 1)
-
-        splitter.addWidget(detail_widget)
-        splitter.setSizes([260, 420])
-        layout.addWidget(splitter, 1)
-
-        btn_layout = QHBoxLayout()
-        self.refresh_btn = PushButton(FIF.SYNC, "刷新")
-        self.refresh_btn.clicked.connect(self.load_releases)
-        self.download_btn = PrimaryPushButton(FIF.UPDATE, "下载选中资源")
-        self.download_btn.clicked.connect(self.download_selected_asset)
-        self.close_btn = PushButton(FIF.CLOSE, "关闭窗口")
-        self.close_btn.clicked.connect(self.close)
-        btn_layout.addStretch()
-        btn_layout.addWidget(self.refresh_btn)
-        btn_layout.addWidget(self.download_btn)
-        btn_layout.addWidget(self.close_btn)
-        layout.addLayout(btn_layout)
-
-        self.load_releases()
-
-    def load_releases(self):
-        self.release_table.setRowCount(0)
-        self.asset_table.setRowCount(0)
-        self.detail_text.clear()
-        self.current_assets = []
-        self.releases = []
-
-        releases, error = self.parent().fetch_releases(self.repo_path)
-        if error:
-            self.detail_text.setPlainText(error)
-            self.download_btn.setEnabled(False)
-            return
-
-        self.releases = releases
-        if not releases:
-            self.detail_text.setPlainText("当前仓库暂无 Release。")
-            self.download_btn.setEnabled(False)
-            return
-
-        for release in releases:
-            row = self.release_table.rowCount()
-            self.release_table.insertRow(row)
-
-            tag_item = QTableWidgetItem(release["tag"])
-            tag_item.setData(Qt.UserRole, release)
-            self.release_table.setItem(row, 0, tag_item)
-            total_size = release_total_size(release)
-            self.release_table.setItem(
-                row, 1, QTableWidgetItem(human_file_size(total_size) if total_size is not None else "N/A")
-            )
-
-        self.release_table.setCurrentCell(0, 0)
-        self.download_btn.setEnabled(True)
-
-    def update_release_detail(self):
-        selected = self.release_table.selectedItems()
-        if not selected:
-            return
-
-        row = selected[0].row()
-        release = self.release_table.item(row, 0).data(Qt.UserRole)
-        if not release:
-            return
-
-        source = release["source"]
-        detail = [
-            f"平台: {source.host}",
-            f"项目: {source.owner}/{source.repo}",
-            f"Tag: {release['tag']}",
-            f"名称: {release['name']}",
-            f"发布时间: {release['published_at']}",
-            f"链接: {release['html_url']}",
-            "",
-            release["body"] or "无说明。",
-        ]
-        self.detail_text.setPlainText("\n".join(detail))
-
-        self.current_assets = release["assets"]
-        self.asset_table.setRowCount(0)
-        for asset in self.current_assets:
-            row = self.asset_table.rowCount()
-            self.asset_table.insertRow(row)
-
-            name_item = QTableWidgetItem(asset["name"])
-            name_item.setData(Qt.UserRole, asset)
-            self.asset_table.setItem(row, 0, name_item)
-            self.asset_table.setItem(row, 1, QTableWidgetItem(human_file_size(asset.get("size"))))
-            self.asset_table.setItem(row, 2, QTableWidgetItem(asset["url"]))
-
-        self.download_btn.setEnabled(bool(self.current_assets))
-
-    def download_selected_asset(self):
-        selected = self.asset_table.selectedItems()
-        if not selected:
-            InfoBar.warning("提示", "请先选中一个下载资源", parent=self)
-            return
-
-        row = selected[0].row()
-        asset = self.asset_table.item(row, 0).data(Qt.UserRole)
-        if not asset:
-            return
-
-        target_dir = QFileDialog.getExistingDirectory(self, "选择下载目录", self.repo_path)
-        if not target_dir:
-            return
-
-        self.parent().download_release_asset(self.repo_path, asset, target_dir)
-
-
 # ====================== 主窗口 ======================
-class GitManager(QMainWindow):
-    update_row_signal = Signal(
-        int, str, str, str, str, str, str, str
-    )  # row, repo, branch, local, remote, status, ahead_behind, release
+class GitManager(MSFluentWindow):
+    update_row_signal = Signal(int, str, str, str, str, str, str)  # row, repo, branch, local, remote, status, ahead_behind
     notify_signal = Signal(str, str, str)
     refresh_repos_signal = Signal()
 
@@ -1194,6 +716,7 @@ class GitManager(QMainWindow):
         self._active_processes: set[subprocess.Popen] = set()
 
         self.init_ui()
+        self.apply_proxy(self.load_proxy())
 
         self.qt_handler = QtLogHandler(self.log_text)
         logger.add(
@@ -1208,6 +731,15 @@ class GitManager(QMainWindow):
         logger.remove()
         super().closeEvent(event)
 
+    def center_window(self):
+        screen = QApplication.primaryScreen()
+        if not screen:
+            return
+        screen_geometry = screen.availableGeometry()
+        x = screen_geometry.x() + (screen_geometry.width() - self.width()) // 2
+        y = screen_geometry.y() + (screen_geometry.height() - self.height()) // 2
+        self.move(x, y)
+
     def load_base_dir(self) -> str:
         default_dir = os.getcwd()
         try:
@@ -1220,6 +752,14 @@ class GitManager(QMainWindow):
 
         return default_dir
 
+    def load_proxy(self) -> str:
+        config = load_config()
+        return str(config.get("proxy") or "http://127.0.0.1:7897").strip()
+
+    def load_token(self) -> str:
+        config = load_config()
+        return str(config.get("token") or "").strip()
+
     def save_base_dir(self):
         try:
             config = load_config()
@@ -1228,21 +768,25 @@ class GitManager(QMainWindow):
         except Exception as e:
             logger.warning(f"保存配置失败: {str(e)}")
 
-    def init_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(16, 12, 16, 12)
-        layout.setSpacing(12)
+    def save_settings(self, base_dir: str, proxy: str, token: str):
+        config = load_config()
+        config["base_dir"] = base_dir
+        config["proxy"] = proxy
+        config["token"] = token
+        save_config(config)
 
-        # 顶部
+    def init_ui(self):
+        self.repo_page = QWidget()
+        self.repo_page.setObjectName("repo_page")
+        repo_layout = QVBoxLayout(self.repo_page)
+        repo_layout.setContentsMargins(16, 12, 16, 12)
+        repo_layout.setSpacing(12)
+
         top = QHBoxLayout()
         self.dir_label = StrongBodyLabel(f"目录: {self.base_dir}")
         top.addWidget(self.dir_label)
         top.addStretch()
 
-        self.select_btn = PushButton(FIF.FOLDER, "选择目录")
-        self.select_btn.clicked.connect(self.select_folder)
         self.scan_btn = PushButton(FIF.SYNC, "扫描仓库")
         self.scan_btn.clicked.connect(self.scan_repos)
         self.add_repo_btn = PushButton(FIF.ADD, "添加仓库")
@@ -1250,57 +794,16 @@ class GitManager(QMainWindow):
         self.remove_repo_btn = PushButton(FIF.DELETE, "删除仓库")
         self.remove_repo_btn.clicked.connect(self.delete_selected_repo)
 
-        top.addWidget(self.select_btn)
         top.addWidget(self.scan_btn)
         top.addWidget(self.add_repo_btn)
         top.addWidget(self.remove_repo_btn)
-        layout.addLayout(top)
+        repo_layout.addLayout(top)
 
-        # 代理
-        proxy_layout = QHBoxLayout()
-        proxy_layout.addWidget(BodyLabel("代理:"))
-        self.proxy_entry = LineEdit()
-        self.proxy_entry.setText("http://127.0.0.1:7897")
-        self.proxy_entry.setMinimumWidth(340)
-        proxy_layout.addWidget(self.proxy_entry)
+        repo_layout.addWidget(HorizontalSeparator())
 
-        apply_btn = PushButton(FIF.SEND, "应用代理")
-        apply_btn.clicked.connect(self.apply_proxy)
-        clear_btn = PushButton(FIF.CLEAR_SELECTION, "清除代理")
-        clear_btn.clicked.connect(self.clear_proxy)
-        proxy_layout.addWidget(apply_btn)
-        proxy_layout.addWidget(clear_btn)
-        proxy_layout.addStretch()
-        layout.addLayout(proxy_layout)
-
-        # GitHub Token
-        token_layout = QHBoxLayout()
-        token_layout.addWidget(BodyLabel("令牌:"))
-        self.github_token_entry = LineEdit()
-        self.github_token_entry.setPlaceholderText("输入 GitHub Token，用于提高 Release 查询额度")
-        self.github_token_entry.setText(saved_github_token())
-        self.github_token_entry.setEchoMode(LineEdit.Password)
-        self.github_token_entry.setClearButtonEnabled(True)
-        self.github_token_entry.setMinimumWidth(420)
-        token_layout.addWidget(self.github_token_entry)
-
-        validate_token_btn = PushButton(FIF.SEND, "验证令牌")
-        validate_token_btn.clicked.connect(self.validate_github_token)
-        clear_token_btn = PushButton(FIF.CLEAR_SELECTION, "清除令牌")
-        clear_token_btn.clicked.connect(self.clear_github_token)
-        token_layout.addWidget(validate_token_btn)
-        token_layout.addWidget(clear_token_btn)
-        token_layout.addStretch()
-        layout.addLayout(token_layout)
-
-        layout.addWidget(HorizontalSeparator())
-
-        # 表格
         self.table = TableWidget()
-        self.table.setColumnCount(7)
-        self.table.setHorizontalHeaderLabels(
-            ["仓库名称", "当前分支", "当前版本", "最新版本", "状态 / 同步", "Release", "操作"]
-        )
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels(["仓库名称", "当前分支", "当前版本", "最新版本", "状态 / 同步", "操作"])
 
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Stretch)
@@ -1309,28 +812,61 @@ class GitManager(QMainWindow):
         header.setSectionResizeMode(3, QHeaderView.Fixed)
         header.setSectionResizeMode(4, QHeaderView.Fixed)
         header.setSectionResizeMode(5, QHeaderView.Fixed)
-        header.setSectionResizeMode(6, QHeaderView.Fixed)
 
         self.table.setColumnWidth(1, 140)
         self.table.setColumnWidth(2, 120)
         self.table.setColumnWidth(3, 120)
         self.table.setColumnWidth(4, 170)
-        self.table.setColumnWidth(5, 100)
-        self.table.setColumnWidth(6, 90)
-
+        self.table.setColumnWidth(5, 90)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.verticalHeader().setVisible(False)
         self.table.itemClicked.connect(self.on_item_clicked)
+        repo_layout.addWidget(self.table, 1)
 
-        layout.addWidget(self.table, 1)
-
-        # 日志
-        log_layout = QVBoxLayout()
-        log_layout.addWidget(StrongBodyLabel("运行日志"))
+        self.log_page = QWidget()
+        self.log_page.setObjectName("log_page")
+        log_page_layout = QVBoxLayout(self.log_page)
+        log_page_layout.setContentsMargins(16, 12, 16, 12)
+        log_page_layout.setSpacing(12)
+        log_page_layout.addWidget(StrongBodyLabel("运行日志"))
         self.log_text = TextEdit()
         self.log_text.setReadOnly(True)
-        log_layout.addWidget(self.log_text)
-        layout.addLayout(log_layout, 1)
+        log_page_layout.addWidget(self.log_text, 1)
+
+        self.settings_page = QWidget()
+        self.settings_page.setObjectName("settings_page")
+        settings_layout = QVBoxLayout(self.settings_page)
+        settings_layout.setContentsMargins(16, 12, 16, 12)
+        settings_layout.setSpacing(12)
+
+        self.settings_group = SettingCardGroup("应用设置", self.settings_page)
+
+        self.dir_card = InputSettingCard(FIF.FOLDER, "目录", "仓库存放目录", "选择", self.settings_group)
+        self.dir_card.set_text(self.base_dir)
+        self.dir_card.set_read_only(True)
+        self.dir_card.button.clicked.connect(self.select_settings_dir)
+        self.settings_group.addSettingCard(self.dir_card)
+
+        self.proxy_card = InputSettingCard(FIF.GLOBE, "代理", "Git 全局 HTTP 代理", parent=self.settings_group)
+        self.proxy_card.set_text(self.load_proxy())
+        self.settings_group.addSettingCard(self.proxy_card)
+
+        self.token_card = InputSettingCard(FIF.SETTING, "Token", "预留字段（可选）", parent=self.settings_group)
+        self.token_card.set_text(self.load_token())
+        self.settings_group.addSettingCard(self.token_card)
+
+        self.save_card = SettingCard(FIF.SAVE, "保存设置", "保存并立即应用代理", self.settings_group)
+        self.settings_save_btn = PrimaryPushButton("保存", self.save_card)
+        self.settings_save_btn.clicked.connect(self.apply_settings_from_page)
+        self.save_card.hBoxLayout.addWidget(self.settings_save_btn, 0, Qt.AlignRight)
+        self.settings_group.addSettingCard(self.save_card)
+
+        settings_layout.addWidget(self.settings_group)
+        settings_layout.addStretch(1)
+
+        self.addSubInterface(self.repo_page, FIF.HOME, "仓库")
+        self.addSubInterface(self.log_page, FIF.DOCUMENT, "日志")
+        self.addSubInterface(self.settings_page, FIF.SETTING, "设置")
 
         self.update_row_signal.connect(self.update_table_row)
         self.notify_signal.connect(self.show_notification)
@@ -1350,199 +886,6 @@ class GitManager(QMainWindow):
 
     def run_git(self, path: str, args: list, timeout=60):
         return self.run_command(["git"] + args, cwd=path, timeout=timeout)
-
-    def fetch_releases(self, repo: str) -> tuple[list[dict], str | None]:
-        remote_url, err, code = self.run_git(repo, ["remote", "get-url", "origin"], timeout=15)
-        if code != 0 or not remote_url:
-            return [], (err or "未找到 origin 远程仓库地址")
-
-        source = parse_release_source(remote_url)
-        if not source:
-            return [], f"暂不支持该远程仓库的 Release 查询: {remote_url}"
-
-        cached = release_cache.get(source)
-        if cached is not None:
-            logger.info(f"Release 使用缓存: {source.host}/{source.owner}/{source.repo}")
-            return cached, None
-
-        if source.host == "github.com":
-            releases, error = self.fetch_github_releases_with_downloader(repo, source)
-            if releases or error:
-                if releases:
-                    release_cache.set(source, releases)
-                return releases, error
-
-        try:
-            release_rate_limiter.wait(source.host)
-            request = urllib.request.Request(
-                source.api_url,
-                headers=build_release_request_headers(),
-            )
-            with urllib.request.urlopen(request, timeout=20) as response:
-                payload = response.read().decode("utf-8", errors="replace")
-            raw_releases = json.loads(payload)
-            if isinstance(raw_releases, dict) and raw_releases.get("message"):
-                return [], str(raw_releases.get("message"))
-            if not isinstance(raw_releases, list):
-                return [], "Release API 返回格式异常"
-
-            releases = [normalize_release(item, source) for item in raw_releases[:30] if isinstance(item, dict)]
-            release_cache.set(source, releases)
-            return releases, None
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", errors="replace")[:200]
-            fallback = self.fetch_tag_release_fallback(repo, source)
-            if fallback:
-                error_type = classify_release_error(e.code, detail)
-                logger.warning(f"Release API 查询失败[{error_type}]，已使用 tag 兜底: HTTP {e.code} {detail}")
-                release_cache.set(source, fallback)
-                return fallback, None
-
-            token_tip = ""
-            if (
-                source.host == "github.com"
-                and e.code in (401, 403)
-                and not github_token()
-            ):
-                token_tip = "\n\n可设置环境变量 GITHUB_TOKEN 或 GH_TOKEN 提高 GitHub API 额度。"
-            error_type = classify_release_error(e.code, detail)
-            return [], f"Release 查询失败[{error_type}]: HTTP {e.code} {detail}{token_tip}"
-        except urllib.error.URLError as e:
-            fallback = self.fetch_tag_release_fallback(repo, source)
-            if fallback:
-                error_type = classify_release_error(exc=e)
-                logger.warning(f"Release API 查询失败[{error_type}]，已使用 tag 兜底: {e.reason}")
-                release_cache.set(source, fallback)
-                return fallback, None
-            error_type = classify_release_error(exc=e)
-            return [], f"Release 查询失败[{error_type}]: {e.reason}"
-        except Exception as e:
-            fallback = self.fetch_tag_release_fallback(repo, source)
-            if fallback:
-                error_type = classify_release_error(detail=str(e), exc=e)
-                logger.warning(f"Release API 查询失败[{error_type}]，已使用 tag 兜底: {str(e)}")
-                release_cache.set(source, fallback)
-                return fallback, None
-            error_type = classify_release_error(detail=str(e), exc=e)
-            return [], f"Release 查询失败[{error_type}]: {str(e)}"
-
-    def fetch_github_releases_with_downloader(
-        self, repo_path: str, source: ReleaseSource
-    ) -> tuple[list[dict], str | None]:
-        downloader_repo = DownloaderGitHubRepo(source.owner, source.repo, github_token())
-        AuthSession.init(downloader_repo)
-
-        try:
-            versions = list(downloader_get_available_versions(downloader_repo))[-30:][::-1]
-        except Exception as e:
-            fallback = self.fetch_tag_release_fallback(repo_path, source)
-            if fallback:
-                logger.warning(f"github-release-downloader 查询失败，已使用 tag 兜底: {str(e)}")
-                return fallback, None
-            return [], f"github-release-downloader 查询失败: {str(e)}"
-
-        releases = []
-        for version in versions:
-            tag = getattr(version, "_origin_tag_name", str(version))
-            try:
-                downloader_assets = downloader_get_assets(downloader_repo, tag)
-            except Exception as e:
-                logger.warning(f"github-release-downloader 获取资源失败 {tag}: {str(e)}")
-                downloader_assets = []
-
-            assets = [
-                {
-                    "name": asset.name,
-                    "size": asset.size,
-                    "url": asset.url,
-                    "download_backend": "github-release-downloader",
-                }
-                for asset in downloader_assets
-            ]
-            releases.append(
-                {
-                    "tag": tag,
-                    "name": tag,
-                    "published_at": "",
-                    "body": "此 Release 信息由 github-release-downloader 获取。",
-                    "html_url": f"https://github.com/{source.owner}/{source.repo}/releases/tag/{tag}",
-                    "source": source,
-                    "assets": assets,
-                }
-            )
-
-        return releases, None
-
-    def fetch_tag_release_fallback(self, repo: str, source: ReleaseSource) -> list[dict]:
-        out, _, code = self.run_git(repo, ["ls-remote", "--tags", "--refs", "origin"], timeout=30)
-        if code != 0 or not out.strip():
-            return []
-
-        tags = []
-        for line in out.splitlines():
-            if "refs/tags/" not in line:
-                continue
-            tag = line.rsplit("refs/tags/", 1)[-1].strip()
-            if tag:
-                tags.append(tag)
-
-        return [build_tag_release_fallback(source, tag) for tag in tags[-30:][::-1]]
-
-    def download_release_asset(self, repo: str, asset: dict, target_dir: str):
-        self.executor.submit(self._download_release_asset_worker, repo, asset, target_dir)
-
-    def _download_release_asset_worker(self, repo: str, asset: dict, target_dir: str):
-        asset_name = sanitize_download_filename(str(asset.get("name") or "release-asset"))
-        target_dir_abs = os.path.abspath(target_dir)
-        if not os.path.isdir(target_dir_abs):
-            self.notify_signal.emit("error", "失败", "下载目录不存在")
-            return
-
-        target_path = os.path.abspath(os.path.join(target_dir_abs, asset_name))
-        if not target_path.startswith(target_dir_abs.rstrip("\\/") + os.sep):
-            self.notify_signal.emit("error", "失败", "下载文件名不安全")
-            return
-
-        stem, suffix = os.path.splitext(asset_name)
-        counter = 1
-        while os.path.exists(target_path):
-            target_path = os.path.abspath(os.path.join(target_dir_abs, f"{stem}_{counter}{suffix}"))
-            counter += 1
-
-        try:
-            logger.info(f"[Release 下载] {repo} -> {target_path}")
-            if asset.get("download_backend") == "github-release-downloader":
-                remote_url, _, _ = self.run_git(repo, ["remote", "get-url", "origin"], timeout=15)
-                source = parse_release_source(remote_url)
-                if source and source.host == "github.com":
-                    AuthSession.init(DownloaderGitHubRepo(source.owner, source.repo, github_token()))
-
-                downloader_asset = DownloaderReleaseAsset(
-                    os.path.basename(target_path),
-                    asset["url"],
-                    int(asset.get("size") or 0),
-                )
-                downloader_download_asset(downloader_asset, Path(target_dir_abs), callback=lambda _, __: None)
-                logger.success(f"Release 资源下载完成: {target_path}")
-                self.notify_signal.emit("success", "下载完成", target_path)
-                return
-
-            request = urllib.request.Request(
-                asset["url"],
-                headers=build_release_request_headers(binary=True),
-            )
-            with urllib.request.urlopen(request, timeout=60) as response, open(target_path, "wb") as f:
-                while True:
-                    chunk = response.read(1024 * 256)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-
-            logger.success(f"Release 资源下载完成: {target_path}")
-            self.notify_signal.emit("success", "下载完成", target_path)
-        except Exception as e:
-            logger.error(f"Release 资源下载失败: {str(e)}")
-            self.notify_signal.emit("error", "下载失败", str(e)[:200])
 
     def run_command(self, cmd: list[str], cwd: str | None = None, timeout=60, env: dict | None = None):
         if self._is_closing:
@@ -1625,64 +968,36 @@ class GitManager(QMainWindow):
             self.save_base_dir()
             logger.info(f"切换目录 → {path}")
 
-    def apply_proxy(self):
-        proxy = self.proxy_entry.text().strip()
+    def apply_proxy(self, proxy: str | None = None):
+        if proxy is None:
+            proxy = self.load_proxy()
+        proxy = proxy.strip()
         if proxy:
             run_hidden(["git", "config", "--global", "http.proxy", proxy])
             logger.success(f"代理已设置: {proxy}")
+        else:
+            self.clear_proxy()
 
     def clear_proxy(self):
         run_hidden(["git", "config", "--global", "--unset", "http.proxy"])
         logger.success("代理已清除")
 
-    def validate_github_token(self):
-        token = self.github_token_entry.text().strip()
-        if not token:
-            InfoBar.warning("提示", "请先输入 GitHub Token", parent=self)
-            return
+    def select_settings_dir(self):
+        path = QFileDialog.getExistingDirectory(self, "选择目录", self.base_dir)
+        if path:
+            self.dir_card.set_text(path)
 
-        self.executor.submit(self._validate_github_token_worker, token)
+    def apply_settings_from_page(self):
+        base_dir = self.dir_card.text() or self.base_dir
+        proxy = self.proxy_card.text()
+        token = self.token_card.text()
 
-    def _validate_github_token_worker(self, token: str):
-        try:
-            request = urllib.request.Request(
-                "https://api.github.com/rate_limit",
-                headers={
-                    "Accept": "application/json",
-                    "Authorization": f"Bearer {token}",
-                    "User-Agent": "GitManager/1.0",
-                },
-            )
-            with urllib.request.urlopen(request, timeout=20) as response:
-                payload = json.loads(response.read().decode("utf-8", errors="replace"))
-
-            limit = payload.get("resources", {}).get("core", {}).get("limit")
-            remaining = payload.get("resources", {}).get("core", {}).get("remaining")
-
-            config = load_config()
-            config["github_token"] = token
-            save_config(config)
-            AuthSession.header = {"Authorization": f"Bearer {token}"}
-
-            logger.success("GitHub Token 验证成功并已保存")
-            rate_text = f"额度: {remaining}/{limit}" if limit is not None and remaining is not None else "验证成功"
-            self.notify_signal.emit("success", "令牌有效", f"GitHub Token 已保存，{rate_text}")
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", errors="replace")[:160]
-            logger.error(f"GitHub Token 验证失败: HTTP {e.code} {detail}")
-            self.notify_signal.emit("error", "令牌无效", f"HTTP {e.code}: {detail}")
-        except Exception as e:
-            logger.error(f"GitHub Token 验证失败: {str(e)}")
-            self.notify_signal.emit("error", "验证失败", str(e)[:200])
-
-    def clear_github_token(self):
-        config = load_config()
-        config.pop("github_token", None)
-        save_config(config)
-        AuthSession.header = {}
-        self.github_token_entry.clear()
-        logger.success("GitHub Token 已清除")
-        InfoBar.success("成功", "GitHub Token 已从配置文件清除", parent=self)
+        self.base_dir = base_dir
+        self.dir_label.setText(f"目录: {self.base_dir}")
+        self.save_settings(base_dir, proxy, token)
+        self.apply_proxy(proxy)
+        logger.success("设置已保存")
+        InfoBar.success("成功", "设置已保存并应用", parent=self)
 
     def scan_repos(self):
         self.table.setRowCount(0)
@@ -1837,8 +1152,8 @@ class GitManager(QMainWindow):
         btn.setFixedWidth(85)
         btn.setToolTip("更新仓库")
         btn.clicked.connect(lambda _, r=row: self.update_single_repo(r))
-        self.table.takeItem(row, 6)
-        self.table.setCellWidget(row, 6, btn)
+        self.table.takeItem(row, 5)
+        self.table.setCellWidget(row, 5, btn)
         return btn
 
     def update_single_repo(self, row: int):
@@ -1846,12 +1161,6 @@ class GitManager(QMainWindow):
         repo = item.data(Qt.UserRole) if item else ""
         if repo:
             self.executor.submit(self.pull_repo, repo, row)
-
-    def show_release_dialog(self, row: int):
-        item = self.table.item(row, 0)
-        repo = item.data(Qt.UserRole) if item else ""
-        if repo and repo != "...":
-            ReleaseDialog(repo, self).exec()
 
     def on_item_clicked(self, item):
         row = item.row()
@@ -1865,8 +1174,6 @@ class GitManager(QMainWindow):
             HistoryDialog(repo, self).exec()
         elif col == 3:  # 最新版本 → diff
             self.show_diff(repo)
-        elif col == 5:  # 发布版本号 → 发布版本列表
-            self.show_release_dialog(row)
 
     def show_diff(self, repo: str):
         def run(args):
@@ -1939,23 +1246,13 @@ class GitManager(QMainWindow):
                 status = "可更新"
                 ahead_behind = f"↑{ahead} ↓{behind}"
 
-            releases, release_error = self.fetch_releases(repo)
-            if releases:
-                release_text = format_release_summary(releases[0])
-            elif release_error:
-                release_text = "查询失败"
-            else:
-                release_text = "无"
-
-            self.update_row_signal.emit(
-                row, repo, branch, local or "N/A", remote or "N/A", status, ahead_behind, release_text
-            )
+            self.update_row_signal.emit(row, repo, branch, local or "N/A", remote or "N/A", status, ahead_behind)
         except Exception as e:
             logger.error(f"加载失败 {repo}: {str(e)}")
-            self.update_row_signal.emit(row, repo, "N/A", "错误", "N/A", "错误", "N/A", "N/A")
+            self.update_row_signal.emit(row, repo, "N/A", "错误", "N/A", "错误", "N/A")
 
     def update_table_row(
-        self, row: int, repo: str, branch: str, local: str, remote: str, status: str, ahead_behind: str, release: str
+        self, row: int, repo: str, branch: str, local: str, remote: str, status: str, ahead_behind: str
     ):
         if row >= self.table.rowCount():
             return
@@ -1970,7 +1267,6 @@ class GitManager(QMainWindow):
                 local,
                 remote,
                 f"{status}  {ahead_behind}" if ahead_behind not in ("N/A", "✓") else status,
-                release,
             ]
         ):
             item = QTableWidgetItem(text)
@@ -1984,15 +1280,8 @@ class GitManager(QMainWindow):
         elif status == "✓ 已同步":
             status_item.setForeground(QColor("#00c853"))
 
-        release_item = self.table.item(row, 5)
-        if release_item and release not in ("无", "N/A", "查询失败"):
-            release_item.setForeground(QColor("#2563eb"))
-            font = release_item.font()
-            font.setUnderline(True)
-            release_item.setFont(font)
-
         # ====================== 关键修改：按钮状态控制 ======================
-        btn = self.table.cellWidget(row, 6)
+        btn = self.table.cellWidget(row, 5)
         if btn:
             is_updatable = status == "可更新"
             btn.setEnabled(is_updatable)
@@ -2094,5 +1383,6 @@ class GitManager(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = GitManager()
+    window.center_window()
     window.show()
     sys.exit(app.exec())
