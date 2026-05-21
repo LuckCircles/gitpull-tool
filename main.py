@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from loguru import logger
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
@@ -29,24 +29,26 @@ from PySide6.QtWidgets import (
 )
 from qfluentwidgets import (
     BodyLabel,
-    CaptionLabel,
+    ExpandGroupSettingCard,
     HorizontalSeparator,
     InfoBar,
     LineEdit,
     ListWidget,
     MessageBox,
     MessageBoxBase,
+    MSFluentWindow,
+    NavigationItemPosition,
     PrimaryPushButton,
     PushButton,
+    PushSettingCard,
+    SettingCardGroup,
     StrongBodyLabel,
     SubtitleLabel,
+    SwitchSettingCard,
     TableWidget,
     TextEdit,
     Theme,
     ToolButton,
-    MSFluentWindow,
-    SettingCardGroup,
-    SettingCard,
     setTheme,
 )
 from qfluentwidgets import FluentIcon as FIF
@@ -66,7 +68,9 @@ def get_app_data_dir() -> Path:
 
 APP_DATA_DIR = get_app_data_dir()
 CONFIG_FILE = APP_DATA_DIR / "config.json"
-logger.add(str(APP_DATA_DIR / "git_manager_{time:YYYY-MM-DD}.log"), rotation="10 MB", retention="7 days", encoding="utf-8")
+logger.add(
+    str(APP_DATA_DIR / "git_manager_{time:YYYY-MM-DD}.log"), rotation="10 MB", retention="7 days", encoding="utf-8"
+)
 MAX_DIFF_BYTES = 1024 * 1024
 
 
@@ -88,8 +92,6 @@ def save_config(config: dict):
             json.dump(config, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.warning(f"保存配置失败: {str(e)}")
-
-
 
 
 def build_hidden_subprocess_kwargs() -> dict:
@@ -383,32 +385,6 @@ class CloneRepoDialog(MessageBoxBase):
         return bool(pattern.match(url))
 
 
-class InputSettingCard(SettingCard):
-    def __init__(self, icon, title: str, content: str = "", button_text: str | None = None, parent=None):
-        super().__init__(icon, title, content, parent)
-        self.line_edit = LineEdit(self)
-        self.line_edit.setClearButtonEnabled(True)
-        self.hBoxLayout.addWidget(self.line_edit, 1, Qt.AlignRight)
-
-        self.button = None
-        if button_text:
-            self.button = PushButton(button_text, self)
-            self.hBoxLayout.addSpacing(8)
-            self.hBoxLayout.addWidget(self.button, 0, Qt.AlignRight)
-
-    def text(self) -> str:
-        return self.line_edit.text().strip()
-
-    def set_text(self, text: str):
-        self.line_edit.setText(text)
-
-    def set_read_only(self, read_only: bool):
-        self.line_edit.setReadOnly(read_only)
-
-    def set_placeholder_text(self, text: str):
-        self.line_edit.setPlaceholderText(text)
-
-
 class QtLogHandler(QObject):
     log_signal = Signal(str)
 
@@ -698,9 +674,12 @@ class BranchDialog(QDialog):
 
 # ====================== 主窗口 ======================
 class GitManager(MSFluentWindow):
-    update_row_signal = Signal(int, str, str, str, str, str, str)  # row, repo, branch, local, remote, status, ahead_behind
+    update_row_signal = Signal(
+        int, str, str, str, str, str, str
+    )  # row, repo, branch, local, remote, status, ahead_behind
     notify_signal = Signal(str, str, str)
     refresh_repos_signal = Signal()
+    scan_summary_signal = Signal(int, int)
 
     def __init__(self):
         super().__init__()
@@ -719,6 +698,11 @@ class GitManager(MSFluentWindow):
         self._is_closing = False
         self._process_lock = threading.Lock()
         self._active_processes: set[subprocess.Popen] = set()
+        self._scan_lock = threading.Lock()
+        self._scan_generation = 0
+        self._scan_expected = 0
+        self._scan_done = 0
+        self._scan_need_update = 0
 
         self.init_ui()
         self.apply_proxy(self.load_proxy())
@@ -802,31 +786,36 @@ class GitManager(MSFluentWindow):
         self.add_repo_btn.clicked.connect(self.show_clone_dialog)
         self.remove_repo_btn = PushButton(FIF.DELETE, "删除仓库")
         self.remove_repo_btn.clicked.connect(self.delete_selected_repo)
+        self.bulk_update_btn = PrimaryPushButton(FIF.UPDATE, "一键更新")
+        self.bulk_update_btn.clicked.connect(self.update_checked_repos)
 
         top.addWidget(self.scan_btn)
         top.addWidget(self.add_repo_btn)
         top.addWidget(self.remove_repo_btn)
+        top.addWidget(self.bulk_update_btn)
         repo_layout.addLayout(top)
 
         repo_layout.addWidget(HorizontalSeparator())
 
         self.table = TableWidget()
-        self.table.setColumnCount(6)
-        self.table.setHorizontalHeaderLabels(["仓库名称", "当前分支", "当前版本", "最新版本", "状态 / 同步", "操作"])
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels(["", "仓库名称", "当前分支", "当前版本", "最新版本", "状态 / 同步", "操作"])
 
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.Fixed)
+        header.setSectionResizeMode(0, QHeaderView.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
         header.setSectionResizeMode(2, QHeaderView.Fixed)
         header.setSectionResizeMode(3, QHeaderView.Fixed)
         header.setSectionResizeMode(4, QHeaderView.Fixed)
         header.setSectionResizeMode(5, QHeaderView.Fixed)
+        header.setSectionResizeMode(6, QHeaderView.Fixed)
 
-        self.table.setColumnWidth(1, 140)
-        self.table.setColumnWidth(2, 120)
+        self.table.setColumnWidth(0, 36)
+        self.table.setColumnWidth(2, 140)
         self.table.setColumnWidth(3, 120)
-        self.table.setColumnWidth(4, 170)
-        self.table.setColumnWidth(5, 90)
+        self.table.setColumnWidth(4, 120)
+        self.table.setColumnWidth(5, 170)
+        self.table.setColumnWidth(6, 90)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.verticalHeader().setVisible(False)
         self.table.itemClicked.connect(self.on_item_clicked)
@@ -849,42 +838,54 @@ class GitManager(MSFluentWindow):
         settings_layout.setSpacing(12)
 
         self.settings_group = SettingCardGroup("应用设置", self.settings_page)
-        self.settings_group.setFixedHeight(340)
-        self.settings_tips = CaptionLabel("建议：目录设置完成后点击“保存”以立即写入配置并应用代理。", self.settings_page)
 
-        self.dir_card = InputSettingCard(FIF.FOLDER, "目录", "仓库存放目录", "选择", self.settings_group)
-        self.dir_card.set_text(self.base_dir)
-        self.dir_card.set_read_only(True)
-        self.dir_card.button.clicked.connect(self.select_settings_dir)
+        self.dir_card = PushSettingCard("选择", FIF.FOLDER, "目录", "仓库存放目录", self.settings_group)
+        self.dir_card.setContent(self.base_dir)
+        self.dir_card.clicked.connect(self.select_settings_dir)
         self.settings_group.addSettingCard(self.dir_card)
 
-        self.proxy_card = InputSettingCard(FIF.GLOBE, "代理", "Git 全局 HTTP 代理", parent=self.settings_group)
-        self.proxy_card.set_placeholder_text("例如: http://127.0.0.1:7897")
-        self.proxy_card.set_text(self.load_proxy())
-        self.settings_group.addSettingCard(self.proxy_card)
+        self.network_group_card = ExpandGroupSettingCard(FIF.GLOBE, "代理与 Token", "展开编辑", self.settings_group)
+        proxy_wrap = QWidget(self.network_group_card)
+        proxy_row = QHBoxLayout(proxy_wrap)
+        proxy_row.setContentsMargins(16, 8, 16, 8)
+        proxy_row.addWidget(BodyLabel("代理:"))
+        self.proxy_entry = LineEdit(proxy_wrap)
+        self.proxy_entry.setText(self.load_proxy())
+        self.proxy_entry.setClearButtonEnabled(True)
+        self.proxy_entry.setPlaceholderText("例如: http://127.0.0.1:7897")
+        proxy_row.addWidget(self.proxy_entry, 1)
+        self.network_group_card.addGroupWidget(proxy_wrap)
 
-        self.token_card = InputSettingCard(FIF.SETTING, "Token", "预留字段（可选）", parent=self.settings_group)
-        self.token_card.set_placeholder_text("可留空")
-        self.token_card.set_text(self.load_token())
-        self.settings_group.addSettingCard(self.token_card)
+        token_wrap = QWidget(self.network_group_card)
+        token_row = QHBoxLayout(token_wrap)
+        token_row.setContentsMargins(16, 8, 16, 8)
+        token_row.addWidget(BodyLabel("Token:"))
+        self.token_entry = LineEdit(token_wrap)
+        self.token_entry.setText(self.load_token())
+        self.token_entry.setClearButtonEnabled(True)
+        self.token_entry.setPlaceholderText("可留空")
+        token_row.addWidget(self.token_entry, 1)
+        self.network_group_card.addGroupWidget(token_wrap)
+        self.settings_group.addSettingCard(self.network_group_card)
 
-        self.save_card = SettingCard(FIF.SAVE, "保存设置", "保存并立即应用代理", self.settings_group)
-        self.settings_save_btn = PrimaryPushButton("保存", self.save_card)
-        self.settings_save_btn.clicked.connect(self.apply_settings_from_page)
-        self.save_card.hBoxLayout.addWidget(self.settings_save_btn, 0, Qt.AlignRight)
-        self.settings_group.addSettingCard(self.save_card)
+        self.save_switch_card = SwitchSettingCard(
+            FIF.SAVE, "保存设置", "打开后立即保存并应用", parent=self.settings_group
+        )
+        self.save_switch_card.checkedChanged.connect(self.on_save_switch_changed)
+        self.settings_group.addSettingCard(self.save_switch_card)
 
         settings_layout.addWidget(self.settings_group)
-        settings_layout.addWidget(self.settings_tips)
+        # settings_layout.addWidget(self.settings_tips)
         settings_layout.addStretch(1)
 
         self.addSubInterface(self.repo_page, FIF.HOME, "仓库")
         self.addSubInterface(self.log_page, FIF.DOCUMENT, "日志")
-        self.addSubInterface(self.settings_page, FIF.SETTING, "设置")
+        self.addSubInterface(self.settings_page, FIF.SETTING, "设置", position=NavigationItemPosition.BOTTOM)
 
         self.update_row_signal.connect(self.update_table_row)
         self.notify_signal.connect(self.show_notification)
         self.refresh_repos_signal.connect(self.scan_repos)
+        self.scan_summary_signal.connect(self.show_scan_summary)
 
     # ====================== 工具方法 ======================
     def log_print(self, msg: str):
@@ -999,12 +1000,12 @@ class GitManager(MSFluentWindow):
     def select_settings_dir(self):
         path = QFileDialog.getExistingDirectory(self, "选择目录", self.base_dir)
         if path:
-            self.dir_card.set_text(path)
+            self.dir_card.setContent(path)
 
     def apply_settings_from_page(self):
-        base_dir = self.dir_card.text() or self.base_dir
-        proxy = self.proxy_card.text()
-        token = self.token_card.text()
+        base_dir = self.dir_card.contentLabel.text().strip() or self.base_dir
+        proxy = self.proxy_entry.text().strip()
+        token = self.token_entry.text().strip()
 
         self.base_dir = base_dir
         self.dir_label.setText(f"目录: {self.base_dir}")
@@ -1013,22 +1014,62 @@ class GitManager(MSFluentWindow):
         logger.success("设置已保存")
         InfoBar.success("成功", "设置已保存并应用", parent=self)
 
+    def on_save_switch_changed(self, checked: bool):
+        if not checked:
+            return
+        self.apply_settings_from_page()
+        QTimer.singleShot(0, self.reset_save_switch)
+
+    def reset_save_switch(self):
+        self.save_switch_card.blockSignals(True)
+        self.save_switch_card.setChecked(False)
+        self.save_switch_card.blockSignals(False)
+
     def scan_repos(self):
         self.table.setRowCount(0)
         self.repos.clear()
         logger.info(f"开始扫描目录: {self.base_dir}")
 
         repo_candidates = scan_git_repos(self.base_dir)
+        with self._scan_lock:
+            self._scan_generation += 1
+            generation = self._scan_generation
+            self._scan_expected = len(repo_candidates)
+            self._scan_done = 0
+            self._scan_need_update = 0
+
         for candidate in repo_candidates:
             self.repos.append(candidate.path)
             row = self.table.rowCount()
             self.table.insertRow(row)
-            for c in range(6):
+            for c in range(7):
                 self.table.setItem(row, c, QTableWidgetItem("..."))
             self._add_update_button(row)
 
+        if not repo_candidates:
+            self.scan_summary_signal.emit(0, 0)
+            return
+
         for i, repo in enumerate(self.repos):
-            self.executor.submit(self.load_repo_info, i, repo)
+            self.executor.submit(self.load_repo_info, i, repo, generation)
+
+    def _mark_scan_progress(self, generation: int, need_update: bool):
+        with self._scan_lock:
+            if generation != self._scan_generation:
+                return
+
+            self._scan_done += 1
+            if need_update:
+                self._scan_need_update += 1
+
+            if self._scan_done == self._scan_expected:
+                self.scan_summary_signal.emit(self._scan_need_update, self._scan_expected)
+
+    def show_scan_summary(self, need_update_count: int, total_count: int):
+        box = MessageBox("扫描完成", f"共扫描 {total_count} 个仓库，其中 {need_update_count} 个需要更新。", self)
+        box.yesButton.setText("知道了")
+        box.cancelButton.hide()
+        box.exec()
 
     def show_clone_dialog(self):
         dialog = CloneRepoDialog(self)
@@ -1051,7 +1092,8 @@ class GitManager(MSFluentWindow):
         if not item:
             return row, None
 
-        repo = item.data(Qt.UserRole) or item.text().strip()
+        repo_item = self.table.item(row, 1)
+        repo = (repo_item.data(Qt.UserRole) if repo_item else "") or ""
         if not repo or repo == "...":
             return row, None
 
@@ -1166,27 +1208,50 @@ class GitManager(MSFluentWindow):
         btn.setFixedWidth(85)
         btn.setToolTip("更新仓库")
         btn.clicked.connect(lambda _, r=row: self.update_single_repo(r))
-        self.table.takeItem(row, 5)
-        self.table.setCellWidget(row, 5, btn)
+        self.table.takeItem(row, 6)
+        self.table.setCellWidget(row, 6, btn)
         return btn
 
     def update_single_repo(self, row: int):
-        item = self.table.item(row, 0)
+        item = self.table.item(row, 1)
         repo = item.data(Qt.UserRole) if item else ""
         if repo:
             self.executor.submit(self.pull_repo, repo, row)
 
+    def get_checked_repos(self) -> list[tuple[int, str]]:
+        checked: list[tuple[int, str]] = []
+        for row in range(self.table.rowCount()):
+            check_item = self.table.item(row, 0)
+            repo_item = self.table.item(row, 1)
+            if not check_item or not repo_item:
+                continue
+            repo = repo_item.data(Qt.UserRole)
+            if repo and check_item.checkState() == Qt.Checked:
+                checked.append((row, repo))
+        return checked
+
+    def update_checked_repos(self):
+        checked_repos = self.get_checked_repos()
+        if not checked_repos:
+            InfoBar.warning("提示", "请先勾选要更新的仓库", parent=self)
+            return
+
+        for row, repo in checked_repos:
+            self.executor.submit(self.pull_repo, repo, row)
+        logger.info(f"[批量更新] 已提交 {len(checked_repos)} 个仓库")
+        InfoBar.success("已开始", f"正在更新 {len(checked_repos)} 个仓库", parent=self)
+
     def on_item_clicked(self, item):
         row = item.row()
         col = item.column()
-        repo_item = self.table.item(row, 0)
+        repo_item = self.table.item(row, 1)
         repo = repo_item.data(Qt.UserRole) if repo_item else ""
 
-        if col == 1:  # 当前分支 → 分支管理
+        if col == 2:  # 当前分支 → 分支管理
             BranchDialog(repo, self).exec()
-        elif col == 2:  # 当前版本 → 历史
+        elif col == 3:  # 当前版本 → 历史
             HistoryDialog(repo, self).exec()
-        elif col == 3:  # 最新版本 → diff
+        elif col == 4:  # 最新版本 → diff
             self.show_diff(repo)
 
     def show_diff(self, repo: str):
@@ -1234,7 +1299,8 @@ class GitManager(MSFluentWindow):
         dlg.exec()
 
     # ====================== 数据加载与按钮状态控制 ======================
-    def load_repo_info(self, row: int, repo: str):
+    def load_repo_info(self, row: int, repo: str, generation: int | None = None):
+        need_update = False
         try:
             local, _, _ = self.run_git(repo, ["rev-parse", "--short", "HEAD"])
             branch, _, _ = self.run_git(repo, ["branch", "--show-current"])
@@ -1259,11 +1325,15 @@ class GitManager(MSFluentWindow):
             else:
                 status = "可更新"
                 ahead_behind = f"↑{ahead} ↓{behind}"
+                need_update = True
 
             self.update_row_signal.emit(row, repo, branch, local or "N/A", remote or "N/A", status, ahead_behind)
         except Exception as e:
             logger.error(f"加载失败 {repo}: {str(e)}")
             self.update_row_signal.emit(row, repo, "N/A", "错误", "N/A", "错误", "N/A")
+        finally:
+            if generation is not None:
+                self._mark_scan_progress(generation, need_update)
 
     def update_table_row(
         self, row: int, repo: str, branch: str, local: str, remote: str, status: str, ahead_behind: str
@@ -1271,9 +1341,18 @@ class GitManager(MSFluentWindow):
         if row >= self.table.rowCount():
             return
 
+        old_check_item = self.table.item(row, 0)
+        old_check_state = old_check_item.checkState() if old_check_item else Qt.Unchecked
+
+        check_item = QTableWidgetItem("")
+        check_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+        check_item.setCheckState(old_check_state)
+        check_item.setTextAlignment(Qt.AlignCenter)
+        self.table.setItem(row, 0, check_item)
+
         repo_item = QTableWidgetItem(os.path.basename(repo.rstrip("\\/")) or repo)
         repo_item.setData(Qt.UserRole, repo)
-        self.table.setItem(row, 0, repo_item)
+        self.table.setItem(row, 1, repo_item)
 
         for col, text in enumerate(
             [
@@ -1285,17 +1364,17 @@ class GitManager(MSFluentWindow):
         ):
             item = QTableWidgetItem(text)
             item.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(row, col + 1, item)
+            self.table.setItem(row, col + 2, item)
 
         # 状态颜色
-        status_item = self.table.item(row, 4)
+        status_item = self.table.item(row, 5)
         if status == "可更新":
             status_item.setForeground(QColor("#ff9800"))
         elif status == "✓ 已同步":
             status_item.setForeground(QColor("#00c853"))
 
         # ====================== 关键修改：按钮状态控制 ======================
-        btn = self.table.cellWidget(row, 5)
+        btn = self.table.cellWidget(row, 6)
         if btn:
             is_updatable = status == "可更新"
             btn.setEnabled(is_updatable)
@@ -1319,7 +1398,7 @@ class GitManager(MSFluentWindow):
             self.load_repo_info(row, repo)
             return
 
-        out, err, code = self.run_git(repo, ["-c", "core.editor=true", "pull", "--ff-only"])
+        out, err, code = self.run_git(repo, ["-c", "core.editor=true", "pull", "--rebase"])
 
         if code == 0:
             logger.success(f"{repo} 更新成功")
