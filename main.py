@@ -1,4 +1,3 @@
-import html
 import json
 import os
 import re
@@ -6,6 +5,25 @@ import shutil
 import stat
 import subprocess
 import sys
+import webbrowser
+
+if sys.version_info >= (3, 12):
+
+    def rmtree(path, ignore_errors=False, onerror=None, onexc=None):
+        return shutil.rmtree(path, ignore_errors=ignore_errors, onexc=onexc if onexc is not None else onerror)
+
+else:
+    import functools
+
+    @functools.wraps(shutil.rmtree)
+    def rmtree(path, ignore_errors=False, onerror=None, onexc=None):
+        handler = onexc if onexc is not None else onerror
+        kwargs = {"ignore_errors": ignore_errors}
+        if handler is not None:
+            kwargs["onerror"] = handler
+        return shutil.rmtree(path, **kwargs)
+
+
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -13,45 +31,25 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from loguru import logger
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QTextCursor
-from PySide6.QtWidgets import (
-    QApplication,
-    QDialog,
-    QFileDialog,
-    QHBoxLayout,
-    QHeaderView,
-    QMessageBox,
-    QTableWidget,
-    QTableWidgetItem,
-    QVBoxLayout,
-    QWidget,
-)
-from qfluentwidgets import (
-    BodyLabel,
-    ExpandGroupSettingCard,
-    HorizontalSeparator,
-    InfoBar,
-    LineEdit,
-    ListWidget,
-    MessageBox,
-    MessageBoxBase,
-    MSFluentWindow,
-    NavigationItemPosition,
-    PrimaryPushButton,
-    PushButton,
-    PushSettingCard,
-    SettingCardGroup,
-    StrongBodyLabel,
-    SubtitleLabel,
-    SwitchSettingCard,
-    TableWidget,
-    TextEdit,
-    Theme,
-    ToolButton,
-    setTheme,
-)
+from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtGui import QClipboard, QColor, QIcon, QTextCursor
+from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog, QHBoxLayout,
+                               QHeaderView, QTableWidget,
+                               QTableWidgetItem, QVBoxLayout, QWidget)
+from qfluentwidgets import Action
 from qfluentwidgets import FluentIcon as FIF
+from qfluentwidgets import (HorizontalSeparator, IndeterminateProgressBar, InfoBar,
+                            LineEdit, MessageBox, MessageBoxBase,
+                            MSFluentWindow, NavigationItemPosition,
+                            PrimaryPushButton, PushButton, PushSettingCard,
+                            RoundMenu, SearchLineEdit, SettingCardGroup,
+                            StrongBodyLabel, SubtitleLabel,
+                            SwitchSettingCard, TableWidget, TextEdit, Theme,
+                            ToolButton, ToolTipFilter, ToolTipPosition,
+                            setTheme)
+
+
+from github_url_utils import normalize_github_url
 
 from res_rc import qInitResources
 
@@ -68,10 +66,29 @@ def get_app_data_dir() -> Path:
 
 APP_DATA_DIR = get_app_data_dir()
 CONFIG_FILE = APP_DATA_DIR / "config.json"
+REPO_CACHE_FILE = APP_DATA_DIR / "repo_cache.json"
 logger.add(
-    str(APP_DATA_DIR / "git_manager_{time:YYYY-MM-DD}.log"), rotation="10 MB", retention="7 days", encoding="utf-8"
+    str(APP_DATA_DIR / "git_manager.log"), rotation="10 MB", retention="7 days", encoding="utf-8"
 )
-MAX_DIFF_BYTES = 1024 * 1024
+
+
+def load_repo_cache() -> list[dict]:
+    try:
+        if not REPO_CACHE_FILE.exists():
+            return []
+        with REPO_CACHE_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_repo_cache(data: list[dict]):
+    try:
+        with REPO_CACHE_FILE.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
 def load_config() -> dict:
@@ -161,33 +178,9 @@ def build_clone_candidates(repo_input: str | GitRepoInfo) -> list[str]:
     return unique_candidates
 
 
-def human_file_size(size: int | str | None) -> str:
-    try:
-        value = float(size or 0)
-    except (TypeError, ValueError):
-        return "N/A"
-
-    for unit in ("B", "KB", "MB", "GB"):
-        if value < 1024 or unit == "GB":
-            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
-        value /= 1024
-
-    return "N/A"
 
 
-def limit_text_bytes(text: str, max_bytes: int = MAX_DIFF_BYTES) -> tuple[str, bool]:
-    encoded = text.encode("utf-8", errors="replace")
-    if len(encoded) <= max_bytes:
-        return text, False
-
-    notice = f"\n\n--- Diff 内容超过 {human_file_size(max_bytes)}，已截断显示 ---"
-    notice_bytes = notice.encode("utf-8", errors="replace")
-    content_limit = max(0, max_bytes - len(notice_bytes))
-    limited = encoded[:content_limit].decode("utf-8", errors="ignore")
-    return limited + notice, True
-
-
-def safe_remove_repo_dir(base_path: str, repo_name: str, onexc=None) -> dict:
+def safe_remove_repo_dir(base_path: str, repo_name: str, onerror=None) -> dict:
     result = {"success": False, "error": None}
 
     if not repo_name or not repo_name.strip():
@@ -223,7 +216,7 @@ def safe_remove_repo_dir(base_path: str, repo_name: str, onexc=None) -> dict:
         return result
 
     try:
-        shutil.rmtree(target_abs, onexc=onexc)
+        rmtree(target_abs, onerror=onerror)
         result["success"] = True
     except Exception as e:
         result["error"] = str(e)
@@ -273,116 +266,151 @@ def scan_git_repos(base_path: str) -> list[GitRepoCandidate]:
     return candidates
 
 
-class DiffDialog(QDialog):
-    def __init__(self, repo: str, sections: dict, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(f"Diff - {repo}")
-        self.resize(900, 600)
-
-        layout = QHBoxLayout(self)
-
-        # 左侧导航
-        self.nav = ListWidget()
-        for key in sections.keys():
-            self.nav.addItem(key)
-
-        # 右侧内容
-        self.viewer = TextEdit()
-        self.viewer.setReadOnly(True)
-        # self.viewer.setFont(QFont("Consolas", 10))
-
-        layout.addWidget(self.nav, 1)
-        layout.addWidget(self.viewer, 4)
-
-        self.sections = sections
-        self.nav.currentTextChanged.connect(self.update_view)
-
-        # 默认选中第一个
-        if sections:
-            self.nav.setCurrentRow(0)
-
-    def update_view(self, key):
-        text = self.sections.get(key, "")
-        self.viewer.setHtml(self.format_diff_html(text))
-
-    @staticmethod
-    def format_diff_html(text: str) -> str:
-        lines = []
-
-        for raw_line in text.splitlines():
-            escaped = html.escape(raw_line)
-
-            if raw_line.startswith("+++") or raw_line.startswith("---"):
-                color = "#8e8e93"
-            elif raw_line.startswith("+"):
-                color = "#16a34a"
-            elif raw_line.startswith("-"):
-                color = "#dc2626"
-            elif raw_line.startswith("@@"):
-                color = "#2563eb"
-            else:
-                color = "#f5f5f5"
-
-            lines.append(f'<span style="color: {color};">{escaped}</span>')
-
-        return "<br>".join(lines) if lines else ""
-
-
 class CloneRepoDialog(MessageBoxBase):
+    clone_progress_signal = Signal(str)  # phase description
+    clone_finished_signal = Signal(bool, str)  # success, message
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.titleLabel = SubtitleLabel("克隆仓库")
         self.urlLineEdit = LineEdit()
-
         self.urlLineEdit.setPlaceholderText("输入 Git 仓库链接")
         self.urlLineEdit.setClearButtonEnabled(True)
 
+        # ---- URL 输入行 + 粘贴按钮 + 格式化按钮 ----
+        url_row = QHBoxLayout()
+        url_row.setSpacing(8)
+        url_row.addWidget(self.urlLineEdit, 1)
+
+        self.paste_btn = ToolButton(FIF.PASTE)
+        ToolTipFilter(self.paste_btn, showDelay=300, position=ToolTipPosition.TOP)
+        self.paste_btn.setToolTip("从剪贴板粘贴")
+        self.paste_btn.clicked.connect(self._paste_from_clipboard)
+        url_row.addWidget(self.paste_btn)
+
+        self.format_btn = ToolButton(FIF.CODE)
+        ToolTipFilter(self.format_btn, showDelay=300, position=ToolTipPosition.TOP)
+        self.format_btn.setToolTip("自动格式化链接（例如 git clone 命令 → 纯 URL）")
+        self.format_btn.clicked.connect(self._format_url)
+        url_row.addWidget(self.format_btn)
+
         self.viewLayout.addWidget(self.titleLabel)
-        self.viewLayout.addWidget(self.urlLineEdit)
+        self.viewLayout.addLayout(url_row)
 
-        # ========== 新增：Git 链接实时验证 ==========
+        # ---- 克隆进度区域 ----
+        self._repo_name_label = StrongBodyLabel("")
+        self._repo_name_label.setVisible(False)
+        self.viewLayout.addWidget(self._repo_name_label)
+
+        self._status_label = SubtitleLabel("")
+        self._status_label.setVisible(False)
+        self.viewLayout.addWidget(self._status_label)
+
+        self._progress_bar = IndeterminateProgressBar()
+        self._progress_bar.setVisible(False)
+        self.viewLayout.addWidget(self._progress_bar)
+
+        # 实时验证
         self.urlLineEdit.textChanged.connect(self._validate_url)
-        self.yesButton.setEnabled(False)  # 初始禁用“克隆”按钮
-        # ===========================================
+        self.yesButton.setEnabled(False)
 
-        self.widget.setMinimumWidth(420)
-        self.yesButton.setText("克隆")
-        self.cancelButton.setText("取消")
+        self.widget.setMinimumWidth(550)
+        self.yesButton.setText("开始克隆")
+        self.cancelButton.setText("关闭")
+
+        # 内部状态
+        self._clone_running = False
+        self.clone_progress_signal.connect(self._update_clone_status)
+        self.clone_finished_signal.connect(self._on_clone_finished)
 
     def repo_url(self) -> str:
         return self.urlLineEdit.text().strip()
 
-    # ========== 新增：Git 链接验证方法 ==========
+    # ---- 剪贴板粘贴 ----
+    def _paste_from_clipboard(self):
+        clipboard = QApplication.clipboard()
+        if clipboard:
+            text = clipboard.text().strip()
+            if text:
+                self.urlLineEdit.setText(text)
+
+    # ---- 自动格式化 ----
+    def _format_url(self):
+        raw = self.urlLineEdit.text().strip()
+        if not raw:
+            self._paste_from_clipboard()
+            raw = self.urlLineEdit.text().strip()
+            if not raw:
+                return
+
+        url = normalize_github_url(raw)
+        if url:
+            self.urlLineEdit.setText(url)
+
+    # ---- URL 验证 ----
     def _validate_url(self):
-        """实时验证输入的 Git 仓库链接"""
-        url = self.urlLineEdit.text().strip()
-        if self._is_valid_git_url(url):
-            self.yesButton.setEnabled(True)
-            # 恢复正常样式（如果之前有错误提示）
-            self.urlLineEdit.setStyleSheet("")
-        else:
+        if self._clone_running:
             self.yesButton.setEnabled(False)
-            # 可选：添加红色边框提示错误（qfluentwidgets 的 LineEdit 支持）
-            # self.urlLineEdit.setStyleSheet("border: 1px solid #e74c3c;")
+            return
+        url = self.urlLineEdit.text().strip()
+        self.yesButton.setEnabled(bool(self._is_valid_git_url(url)))
 
     @staticmethod
     def _is_valid_git_url(url: str) -> bool:
-        """Git 仓库链接验证（支持 HTTPS、SSH、Git 协议等常见格式）"""
         if not url:
             return False
-
-        # 推荐的 Git URL 正则（经过实际项目验证，能覆盖绝大部分合法场景）
         pattern = re.compile(
-            r'^(?:(?:https?|git|ssh)://'  # 协议
-            r'(?:[^@]+@)?'  # 可选用户名
-            r'[\w.-]+'  # 主机名
-            r'(?::\d+)?'  # 可选端口
-            r'[:/]'  # 分隔符
-            r'[\w./-]+?'  # 路径
-            r'(?:\.git)?/?)$',  # 可选 .git 后缀
+            r'^(?:(?:https?|git|ssh)://'
+            r'(?:[^@]+@)?'
+            r'[\w.-]+'
+            r'(?::\d+)?'
+            r'[:/]'
+            r'[\w./-]+?'
+            r'(?:\.git)?/?)$',
             re.IGNORECASE,
         )
         return bool(pattern.match(url))
+
+    # ---- 克隆流程 ----
+    def start_clone(self):
+        """由外部调用，传入当前状态的信号。"""
+        if self._clone_running:
+            return
+        self._clone_running = True
+        self._show_clone_ui(True)
+
+    def _show_clone_ui(self, visible: bool):
+        self._repo_name_label.setVisible(visible)
+        self._status_label.setVisible(visible)
+        self._progress_bar.setVisible(visible)
+        if visible:
+            self._progress_bar.start()
+        else:
+            self._progress_bar.stop()
+
+    def _update_clone_status(self, phase: str):
+        self._status_label.setText(phase)
+
+    def _on_clone_finished(self, success: bool, message: str):
+        self._clone_running = False
+        self._progress_bar.stop()
+        self._progress_bar.setVisible(False)
+
+        if success:
+            self._status_label.setText("克隆完成")
+            InfoBar.success("克隆成功", message, duration=4000, parent=self)
+        else:
+            self._status_label.setText("克隆失败")
+            InfoBar.error("克隆失败", message, duration=5000, parent=self)
+
+        # 重置 UI 允许连续克隆
+        self._repo_name_label.setVisible(False)
+        self.urlLineEdit.clear()
+        self.urlLineEdit.setEnabled(True)
+        self.yesButton.setEnabled(False)
+        self.yesButton.setText("开始克隆")
+        self.paste_btn.setEnabled(True)
+        self.format_btn.setEnabled(True)
 
 
 class QtLogHandler(QObject):
@@ -675,11 +703,11 @@ class BranchDialog(QDialog):
 # ====================== 主窗口 ======================
 class GitManager(MSFluentWindow):
     update_row_signal = Signal(
-        int, str, str, str, str, str, str
-    )  # row, repo, branch, local, remote, status, ahead_behind
+        int, str, str, str, str, str, str, str
+    )  # row, repo, branch, local, remote_commit, status, ahead_behind, remote_url
     notify_signal = Signal(str, str, str)
-    refresh_repos_signal = Signal()
     scan_summary_signal = Signal(int, int)
+    update_complete_signal = Signal(str, bool, str)  # repo_name, success, message
 
     def __init__(self):
         super().__init__()
@@ -694,6 +722,7 @@ class GitManager(MSFluentWindow):
         self._config_cache = self._load_cached_config()
         self.base_dir = self.load_base_dir()
         self.repos: list[str] = []
+        self._repo_cache: dict[str, dict] = {}  # path -> cached info
         self.executor = ThreadPoolExecutor(max_workers=6)
         self._is_closing = False
         self._process_lock = threading.Lock()
@@ -723,6 +752,8 @@ class GitManager(MSFluentWindow):
         self._is_closing = True
         self.executor.shutdown(wait=False, cancel_futures=True)
         self._terminate_active_processes()
+        # 保存仓库缓存
+        save_repo_cache(list(self._repo_cache.values()))
         logger.remove()
         super().closeEvent(event)
 
@@ -780,6 +811,13 @@ class GitManager(MSFluentWindow):
         top.addWidget(self.dir_label)
         top.addStretch()
 
+        self.search_edit = SearchLineEdit()
+        self.search_edit.setPlaceholderText("搜索仓库...")
+        self.search_edit.setFixedWidth(200)
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.textChanged.connect(self._filter_repos)
+        top.addWidget(self.search_edit)
+
         self.scan_btn = PushButton(FIF.SYNC, "扫描仓库")
         self.scan_btn.clicked.connect(self.scan_repos)
         self.add_repo_btn = PushButton(FIF.ADD, "添加仓库")
@@ -818,6 +856,8 @@ class GitManager(MSFluentWindow):
         self.table.setColumnWidth(6, 90)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.verticalHeader().setVisible(False)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.on_context_menu)
         self.table.itemClicked.connect(self.on_item_clicked)
         repo_layout.addWidget(self.table, 1)
 
@@ -834,48 +874,94 @@ class GitManager(MSFluentWindow):
         self.settings_page = QWidget()
         self.settings_page.setObjectName("settings_page")
         settings_layout = QVBoxLayout(self.settings_page)
-        settings_layout.setContentsMargins(16, 12, 16, 12)
-        settings_layout.setSpacing(12)
+        settings_layout.setContentsMargins(24, 20, 24, 20)
+        settings_layout.setSpacing(20)
 
-        self.settings_group = SettingCardGroup("应用设置", self.settings_page)
-
-        self.dir_card = PushSettingCard("选择", FIF.FOLDER, "目录", "仓库存放目录", self.settings_group)
+        # ========== 目录设置 ==========
+        self.dir_group = SettingCardGroup("存储目录", self.settings_page)
+        self.dir_card = PushSettingCard(
+            "选择目录",
+            FIF.FOLDER,
+            "仓库存放目录",
+            "所有 Git 仓库将被存放在此目录下",
+            self.dir_group,
+        )
         self.dir_card.setContent(self.base_dir)
         self.dir_card.clicked.connect(self.select_settings_dir)
-        self.settings_group.addSettingCard(self.dir_card)
+        self.dir_group.addSettingCard(self.dir_card)
+        settings_layout.addWidget(self.dir_group)
 
-        self.network_group_card = ExpandGroupSettingCard(FIF.GLOBE, "代理与 Token", "展开编辑", self.settings_group)
-        proxy_wrap = QWidget(self.network_group_card)
-        proxy_row = QHBoxLayout(proxy_wrap)
-        proxy_row.setContentsMargins(16, 8, 16, 8)
-        proxy_row.addWidget(BodyLabel("代理:"))
-        self.proxy_entry = LineEdit(proxy_wrap)
-        self.proxy_entry.setText(self.load_proxy())
-        self.proxy_entry.setClearButtonEnabled(True)
-        self.proxy_entry.setPlaceholderText("例如: http://127.0.0.1:7897")
-        proxy_row.addWidget(self.proxy_entry, 1)
-        self.network_group_card.addGroupWidget(proxy_wrap)
+        # ========== 网络设置 ==========
+        self.network_group = SettingCardGroup("网络设置", self.settings_page)
 
-        token_wrap = QWidget(self.network_group_card)
-        token_row = QHBoxLayout(token_wrap)
-        token_row.setContentsMargins(16, 8, 16, 8)
-        token_row.addWidget(BodyLabel("Token:"))
-        self.token_entry = LineEdit(token_wrap)
-        self.token_entry.setText(self.load_token())
-        self.token_entry.setClearButtonEnabled(True)
-        self.token_entry.setPlaceholderText("可留空")
-        token_row.addWidget(self.token_entry, 1)
-        self.network_group_card.addGroupWidget(token_wrap)
-        self.settings_group.addSettingCard(self.network_group_card)
-
-        self.save_switch_card = SwitchSettingCard(
-            FIF.SAVE, "保存设置", "打开后立即保存并应用", parent=self.settings_group
+        self.proxy_card = PushSettingCard(
+            "点击编辑",
+            FIF.GLOBE,
+            "代理地址",
+            "用于加速 Git 克隆和拉取，如 http://127.0.0.1:7897",
+            self.network_group,
         )
-        self.save_switch_card.checkedChanged.connect(self.on_save_switch_changed)
-        self.settings_group.addSettingCard(self.save_switch_card)
+        self.proxy_card.setContent(self.load_proxy() or "未设置")
+        self.proxy_card.clicked.connect(self._edit_proxy)
+        self.network_group.addSettingCard(self.proxy_card)
 
-        settings_layout.addWidget(self.settings_group)
-        # settings_layout.addWidget(self.settings_tips)
+        self.token_card = PushSettingCard(
+            "点击编辑",
+            FIF.HEART,
+            "访问令牌",
+            "用于私有仓库认证，支持 GitHub / Gitee Token",
+            self.network_group,
+        )
+        token = self.load_token()
+        self.token_card.setContent(self._mask_token(token))
+        self.token_card.clicked.connect(self._edit_token)
+        self.network_group.addSettingCard(self.token_card)
+
+        self.proxy_switch = SwitchSettingCard(
+            FIF.POWER_BUTTON,
+            "启用代理",
+            content="关闭后 Git 操作将不使用代理",
+            parent=self.network_group,
+        )
+        self.proxy_switch.setChecked(True)
+        self.proxy_switch.checkedChanged.connect(self._on_proxy_toggle)
+        self.network_group.addSettingCard(self.proxy_switch)
+
+        settings_layout.addWidget(self.network_group)
+
+        # ========== 关于 ==========
+        self.about_group = SettingCardGroup("关于", self.settings_page)
+        self.about_card = PushSettingCard(
+            "查看",
+            FIF.INFO,
+            "Git 多仓库管理器",
+            "高级版 · 支持批量管理、分支切换、版本回退",
+            self.about_group,
+        )
+        self.about_card.clicked.connect(
+            lambda: InfoBar.info("关于", "Git 多仓库管理器 v2.0\n基于 PySide6 + FluentWidgets 构建", parent=self)
+        )
+        self.about_group.addSettingCard(self.about_card)
+        settings_layout.addWidget(self.about_group)
+
+        # ========== 底部保存按钮 ==========
+        bottom_widget = QWidget()
+        bottom_layout = QHBoxLayout(bottom_widget)
+        bottom_layout.setContentsMargins(0, 8, 0, 0)
+
+        self.save_btn = PrimaryPushButton(FIF.SAVE, "保存设置")
+        self.save_btn.setMinimumWidth(160)
+        self.save_btn.clicked.connect(self.apply_settings_from_page)
+
+        self.reset_btn = PushButton(FIF.CANCEL, "重置")
+        self.reset_btn.setMinimumWidth(100)
+        self.reset_btn.clicked.connect(self._reset_settings)
+
+        bottom_layout.addStretch()
+        bottom_layout.addWidget(self.reset_btn)
+        bottom_layout.addWidget(self.save_btn)
+        settings_layout.addWidget(bottom_widget)
+
         settings_layout.addStretch(1)
 
         self.addSubInterface(self.repo_page, FIF.HOME, "仓库")
@@ -884,8 +970,14 @@ class GitManager(MSFluentWindow):
 
         self.update_row_signal.connect(self.update_table_row)
         self.notify_signal.connect(self.show_notification)
-        self.refresh_repos_signal.connect(self.scan_repos)
         self.scan_summary_signal.connect(self.show_scan_summary)
+        self.update_complete_signal.connect(self.show_update_complete)
+
+        # 启动后保持空闲，仓库列表只在用户点击“扫描仓库”后刷新。
+
+    def _load_repo_cache_startup(self):
+        """启动时不加载、不扫描、不刷新仓库列表。"""
+        return
 
     # ====================== 工具方法 ======================
     def log_print(self, msg: str):
@@ -1004,30 +1096,102 @@ class GitManager(MSFluentWindow):
 
     def apply_settings_from_page(self):
         base_dir = self.dir_card.contentLabel.text().strip() or self.base_dir
-        proxy = self.proxy_entry.text().strip()
-        token = self.token_entry.text().strip()
+        proxy = self.proxy_card.contentLabel.text().strip()
+        token = self.token_card.contentLabel.text().strip()
+        proxy_enabled = self.proxy_switch.isChecked()
+
+        if proxy == "未设置":
+            proxy = ""
+
+        if token == "未设置":
+            token = ""
 
         self.base_dir = base_dir
         self.dir_label.setText(f"目录: {self.base_dir}")
         self.save_settings(base_dir, proxy, token)
-        self.apply_proxy(proxy)
+        if proxy_enabled and proxy:
+            self.apply_proxy(proxy)
+        else:
+            self.clear_proxy()
         logger.success("设置已保存")
         InfoBar.success("成功", "设置已保存并应用", parent=self)
 
-    def on_save_switch_changed(self, checked: bool):
-        if not checked:
-            return
-        self.apply_settings_from_page()
-        QTimer.singleShot(0, self.reset_save_switch)
+    def _edit_proxy(self):
+        dialog = MessageBoxBase(self)
+        dialog.titleLabel = SubtitleLabel("编辑代理地址")
+        dialog.cancelButton.setText("取消")
+        dialog.yesButton.setText("确定")
 
-    def reset_save_switch(self):
-        self.save_switch_card.blockSignals(True)
-        self.save_switch_card.setChecked(False)
-        self.save_switch_card.blockSignals(False)
+        editor = LineEdit()
+        editor.setText(self.load_proxy())
+        editor.setClearButtonEnabled(True)
+        editor.setPlaceholderText("例如: http://127.0.0.1:7897")
+        dialog.viewLayout.addWidget(dialog.titleLabel)
+        dialog.viewLayout.addWidget(editor)
+        dialog.widget.setMinimumWidth(420)
+
+        if dialog.exec():
+            new_proxy = editor.text().strip()
+            self.proxy_card.setContent(new_proxy or "未设置")
+
+    def _edit_token(self):
+        dialog = MessageBoxBase(self)
+        dialog.titleLabel = SubtitleLabel("编辑访问令牌")
+        dialog.cancelButton.setText("取消")
+        dialog.yesButton.setText("确定")
+
+        editor = LineEdit()
+        editor.setText(self.load_token())
+        editor.setClearButtonEnabled(True)
+        editor.setPlaceholderText("支持 GitHub / Gitee Token")
+        dialog.viewLayout.addWidget(dialog.titleLabel)
+        dialog.viewLayout.addWidget(editor)
+        dialog.widget.setMinimumWidth(420)
+
+        if dialog.exec():
+            new_token = editor.text().strip()
+            self.token_card.setContent(self._mask_token(new_token))
+
+    def _reset_settings(self):
+        self.proxy_card.setContent(self.load_proxy() or "未设置")
+        token = self.load_token()
+        self.token_card.setContent(self._mask_token(token))
+        self.dir_card.setContent(self.base_dir)
+        self.proxy_switch.setChecked(True)
+        InfoBar.info("提示", "已重置为当前保存的设置", parent=self)
+
+    def _on_proxy_toggle(self, checked: bool):
+        proxy = self.proxy_card.contentLabel.text().strip()
+        if proxy == "未设置":
+            proxy = ""
+        if checked and proxy:
+            self.apply_proxy(proxy)
+        else:
+            self.clear_proxy()
+
+    @staticmethod
+    def _mask_token(token: str) -> str:
+        if not token:
+            return "未设置"
+        if len(token) <= 8:
+            return token[:2] + "*" * (len(token) - 4) + token[-2:] if len(token) >= 4 else "****"
+        return token[:4] + "*" * (len(token) - 8) + token[-4:]
+
+    def _filter_repos(self, keyword: str):
+        keyword = keyword.strip().lower()
+        for row in range(self.table.rowCount()):
+            repo_item = self.table.item(row, 1)
+            if not repo_item:
+                self.table.setRowHidden(row, bool(keyword))
+                continue
+            repo = repo_item.data(Qt.UserRole) or ""
+            name = os.path.basename(repo.rstrip("\\/") or repo)
+            self.table.setRowHidden(row, keyword not in name.lower())
 
     def scan_repos(self):
         self.table.setRowCount(0)
         self.repos.clear()
+        self._repo_cache.clear()
         logger.info(f"开始扫描目录: {self.base_dir}")
 
         repo_candidates = scan_git_repos(self.base_dir)
@@ -1066,10 +1230,16 @@ class GitManager(MSFluentWindow):
                 self.scan_summary_signal.emit(self._scan_need_update, self._scan_expected)
 
     def show_scan_summary(self, need_update_count: int, total_count: int):
-        box = MessageBox("扫描完成", f"共扫描 {total_count} 个仓库，其中 {need_update_count} 个需要更新。", self)
-        box.yesButton.setText("知道了")
-        box.cancelButton.hide()
-        box.exec()
+        if need_update_count == 0:
+            InfoBar.success("扫描完成", f"共 {total_count} 个仓库，全部已同步", duration=4000, parent=self)
+        else:
+            InfoBar.warning("扫描完成", f"共 {total_count} 个仓库，其中 {need_update_count} 个需要更新", duration=5000, parent=self)
+
+    def show_update_complete(self, repo_name: str, success: bool, message: str):
+        if success:
+            InfoBar.success("更新成功", f"{repo_name} 已是最新版本", duration=4000, parent=self)
+        else:
+            InfoBar.error("更新失败", f"{repo_name} 更新失败。\n{message}", duration=5000, parent=self)
 
     def show_clone_dialog(self):
         dialog = CloneRepoDialog(self)
@@ -1081,7 +1251,58 @@ class GitManager(MSFluentWindow):
             InfoBar.warning("提示", "请输入仓库链接", parent=self)
             return
 
-        self.executor.submit(self.clone_repo, repo_url)
+        # 在后台线程中执行克隆，同时把输出传回对话框
+        self.executor.submit(self._clone_with_output, repo_url, dialog)
+
+    def _clone_with_output(self, repo_url: str, dialog: CloneRepoDialog):
+        """在线程中执行克隆，将 stdout 写入对话框的 outputEdit。"""
+        repo_name = derive_repo_name(repo_url)
+        base_abs = os.path.abspath(self.base_dir)
+        normalized = normalize_github_url(repo_url) or repo_url
+
+        # 先检查目录是否已存在
+        if os.path.exists(os.path.join(base_abs, repo_name)):
+            self.notify_signal.emit("error", "克隆失败", f"目录已存在: {repo_name}")
+            return
+
+        # 在对话框里显示进度
+        self._append_clone_output(dialog, f"> git clone {normalized}\n")
+
+        # 直接执行 git clone
+        out, err, code = self.run_command(
+            ["git", "clone", "--progress", normalized, repo_name],
+            cwd=base_abs,
+            timeout=600,
+        )
+
+        self._append_clone_output(dialog, out + "\n")
+        if err:
+            self._append_clone_output(dialog, err + "\n")
+        self._append_clone_output(dialog, "\n--- 完成 ---\n")
+
+        if code == 0:
+            target_path = os.path.abspath(os.path.join(base_abs, repo_name))
+            logger.success(f"仓库克隆成功: {target_path}")
+            if os.path.isdir(os.path.join(target_path, ".git")):
+                self._add_repo_row(target_path)
+                self.notify_signal.emit("success", "克隆成功", f"{repo_name} 已添加到列表")
+            else:
+                self.notify_signal.emit("success", "克隆成功", f"仓库已克隆到: {target_path}")
+        else:
+            error_msg = (err or out or "克隆失败")[:200]
+            logger.error(f"仓库克隆失败: {error_msg}")
+            self.notify_signal.emit("error", "克隆失败", error_msg)
+
+    def _append_clone_output(self, dialog: CloneRepoDialog, text: str):
+        """跨线程安全地将文本追加到对话框的 TextEdit 中。"""
+        from PySide6.QtCore import QMetaObject, Qt as Qt2, Q_ARG
+
+        QMetaObject.invokeMethod(
+            dialog.outputEdit,
+            "append",
+            Qt2.QueuedConnection,
+            Q_ARG(str, text.rstrip()),
+        )
 
     def get_selected_repo(self):
         row = self.table.currentRow()
@@ -1120,11 +1341,16 @@ class GitManager(MSFluentWindow):
             return
 
         try:
-            result = safe_remove_repo_dir(self.base_dir, repo_name, onexc=self._handle_remove_readonly)
+            result = safe_remove_repo_dir(self.base_dir, repo_name, onerror=self._handle_remove_readonly)
             if result["success"]:
                 logger.success(f"已删除仓库: {selected_target}")
+                # 直接从表格和缓存移除该行
+                self.table.removeRow(row)
+                try:
+                    self.repos.remove(repo)
+                except ValueError:
+                    pass
                 InfoBar.success("成功", "仓库已删除", parent=self)
-                self.scan_repos()
             else:
                 logger.error(f"删除仓库失败: {result['error']}")
                 InfoBar.error("失败", (result["error"] or "删除失败")[:150], parent=self)
@@ -1133,13 +1359,14 @@ class GitManager(MSFluentWindow):
             InfoBar.error("失败", str(e)[:150], parent=self)
 
     @staticmethod
-    def _handle_remove_readonly(func, path, exc_info):
-        exc = exc_info[1]
-        if isinstance(exc, PermissionError):
+    def _handle_remove_readonly(func, path, exc):
+        # exc 在 onexc 回调中是异常对象本身，在旧 onerror 中是 (type, value, tb) 元组
+        actual_exc = exc[1] if isinstance(exc, tuple) else exc
+        if isinstance(actual_exc, OSError):
             os.chmod(path, stat.S_IWRITE)
             func(path)
             return
-        raise exc
+        raise actual_exc
 
     def clone_repo(self, repo_input: str | GitRepoInfo) -> dict:
         result = self.clone_git_repo(repo_input, self.base_dir)
@@ -1147,14 +1374,16 @@ class GitManager(MSFluentWindow):
         target_path = os.path.abspath(os.path.join(self.base_dir, repo_name)) if repo_name else ""
 
         if result["success"]:
-            success_message = f"已克隆到: {target_path}" if target_path else "仓库克隆成功"
             logger.success(f"仓库克隆成功: {target_path or repo_name}")
-            self.notify_signal.emit("success", "成功", success_message)
-            self.refresh_repos_signal.emit()
+            if target_path and os.path.isdir(os.path.join(target_path, ".git")):
+                self._add_repo_row(target_path)
+                self.notify_signal.emit("success", "克隆成功", f"{repo_name} 已添加到列表")
+            else:
+                self.notify_signal.emit("success", "克隆成功", f"仓库已克隆到: {target_path}")
         else:
             error_message = result["error"] or "克隆失败"
             logger.error(f"仓库克隆失败: {error_message}")
-            self.notify_signal.emit("error", "失败", error_message[:200])
+            self.notify_signal.emit("error", "克隆失败", error_message[:200])
 
         return result
 
@@ -1195,7 +1424,7 @@ class GitManager(MSFluentWindow):
             errors.append(f"{candidate} -> {err or out or '克隆失败'}")
             if os.path.exists(target_path):
                 try:
-                    shutil.rmtree(target_path, onexc=self._handle_remove_readonly)
+                    rmtree(target_path, onerror=self._handle_remove_readonly)
                 except Exception as cleanup_error:
                     errors.append(f"清理失败: {str(cleanup_error)}")
                     break
@@ -1206,11 +1435,28 @@ class GitManager(MSFluentWindow):
         """创建更新按钮（只显示图标）"""
         btn = ToolButton(FIF.UPDATE)
         btn.setFixedWidth(85)
+        ToolTipFilter(btn, showDelay=300, position=ToolTipPosition.TOP)
         btn.setToolTip("更新仓库")
         btn.clicked.connect(lambda _, r=row: self.update_single_repo(r))
         self.table.takeItem(row, 6)
         self.table.setCellWidget(row, 6, btn)
         return btn
+
+    def _add_repo_row(self, repo_path: str):
+        """直接添加一行仓库到表格，不重新扫描"""
+        repo_path = os.path.abspath(repo_path)
+        if repo_path in self.repos:
+            return
+        self.repos.append(repo_path)
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        for c in range(7):
+            self.table.setItem(row, c, QTableWidgetItem("..."))
+        self._add_update_button(row)
+        # 撤销搜索过滤确保新行可见
+        self.search_edit.clear()
+        # 加载仓库信息
+        self.executor.submit(self.load_repo_info, row, repo_path, None)
 
     def update_single_repo(self, row: int):
         item = self.table.item(row, 1)
@@ -1241,62 +1487,85 @@ class GitManager(MSFluentWindow):
         logger.info(f"[批量更新] 已提交 {len(checked_repos)} 个仓库")
         InfoBar.success("已开始", f"正在更新 {len(checked_repos)} 个仓库", parent=self)
 
-    def on_item_clicked(self, item):
-        row = item.row()
-        col = item.column()
-        repo_item = self.table.item(row, 1)
-        repo = repo_item.data(Qt.UserRole) if repo_item else ""
-
-        if col == 2:  # 当前分支 → 分支管理
-            BranchDialog(repo, self).exec()
-        elif col == 3:  # 当前版本 → 历史
-            HistoryDialog(repo, self).exec()
-        elif col == 4:  # 最新版本 → diff
-            self.show_diff(repo)
-
-    def show_diff(self, repo: str):
-        def run(args):
-            return self.run_git(repo, args)
-
-        def add_limited_section(title: str, text: str):
-            if not text.strip():
-                return
-            limited_text, truncated = limit_text_bytes(text)
-            sections[title + ("（已截断）" if truncated else "")] = limited_text
-
-        sections = {}
-
-        # 工作区
-        out, _, _ = run(["diff"])
-        add_limited_section("📂 工作区变更", out)
-
-        # 暂存区
-        out, _, _ = run(["diff", "--cached"])
-        add_limited_section("📌 已暂存", out)
-
-        # upstream 检查
-        _, _, code = run(["rev-parse", "--symbolic-full-name", "@{u}"])
-        has_upstream = code == 0
-        if code == 0:
-            out, _, _ = run(["diff", "HEAD", "@{u}"])
-            add_limited_section("🌐 本地 vs 远程", out)
-
-            out, _, _ = run(["log", "--oneline", "@{u}..HEAD"])
-            if out.strip():
-                sections["⬆ 本地领先"] = out
-
-            out, _, _ = run(["log", "--oneline", "HEAD..@{u}"])
-            if out.strip():
-                sections["⬇ 远程领先"] = out
-        else:
-            sections["⚠ 信息"] = "未设置 upstream"
-
-        if not sections:
-            QMessageBox.information(self, "Diff", "无差异")
+    def on_context_menu(self, pos):
+        item = self.table.itemAt(pos)
+        if not item:
             return
 
-        dlg = DiffDialog(repo, sections, self)
-        dlg.exec()
+        row = item.row()
+        repo_item = self.table.item(row, 1)
+        repo = repo_item.data(Qt.UserRole) if repo_item else ""
+        if not repo or repo == "...":
+            return
+
+        menu = RoundMenu(parent=self)
+
+        menu.addAction(Action(FIF.FOLDER, "打开本地", triggered=lambda: self._open_local_folder(repo)))
+
+        cache = self._repo_cache.get(repo, {})
+        remote_url = cache.get("remote_url", "")
+        open_remote = Action(FIF.GLOBE, "打开远端", triggered=lambda: self._open_remote_url(repo))
+        if not remote_url:
+            open_remote.setEnabled(False)
+        menu.addAction(open_remote)
+
+        menu.addSeparator()
+
+        menu.addAction(Action(FIF.DELETE, "删除仓库", triggered=lambda: self._context_delete_repo(row, repo)))
+
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _open_local_folder(self, repo: str):
+        path = os.path.abspath(repo)
+        if sys.platform == "win32":
+            os.startfile(path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+        logger.info(f"打开本地目录: {path}")
+
+    def _open_remote_url(self, repo: str):
+        cache = self._repo_cache.get(repo, {})
+        remote_url = cache.get("remote_url", "")
+        if not remote_url:
+            InfoBar.warning("提示", "未找到远端地址", parent=self)
+            return
+
+        webbrowser.open(remote_url)
+        logger.info(f"打开远端地址: {remote_url}")
+
+    def _context_delete_repo(self, row: int, repo: str):
+        repo_name = os.path.basename(repo.rstrip("\\/"))
+        expected_target = os.path.abspath(os.path.join(os.path.abspath(self.base_dir), repo_name))
+        selected_target = os.path.abspath(repo)
+        if selected_target != expected_target:
+            InfoBar.error("失败", "只允许删除当前基础目录下的直属仓库目录", parent=self)
+            return
+
+        box = MessageBox("确认删除仓库", f"确定删除本地仓库？\n\n{repo}", self)
+        box.yesButton.setText("删除")
+        box.cancelButton.setText("取消")
+        if not box.exec():
+            return
+
+        try:
+            result = safe_remove_repo_dir(self.base_dir, repo_name, onerror=self._handle_remove_readonly)
+            if result["success"]:
+                logger.success(f"已删除仓库: {selected_target}")
+                self.table.removeRow(row)
+                try:
+                    self.repos.remove(repo)
+                except ValueError:
+                    pass
+                self._repo_cache.pop(repo, None)
+                InfoBar.success("成功", "仓库已删除", parent=self)
+            else:
+                logger.error(f"删除仓库失败: {result['error']}")
+                InfoBar.error("失败", (result["error"] or "删除失败")[:150], parent=self)
+        except Exception as e:
+            logger.error(f"删除仓库失败: {str(e)}")
+            InfoBar.error("失败", str(e)[:150], parent=self)
 
     # ====================== 数据加载与按钮状态控制 ======================
     def load_repo_info(self, row: int, repo: str, generation: int | None = None):
@@ -1307,6 +1576,9 @@ class GitManager(MSFluentWindow):
             if not branch:
                 branch = "游离 HEAD"
 
+            # 获取远端地址
+            remote_url, _, _ = self.run_git(repo, ["remote", "get-url", "origin"])
+
             self.run_git(repo, ["fetch", "--quiet"])
 
             ahead, _, _ = self.run_git(repo, ["rev-list", "--count", "HEAD", "^@{u}"])
@@ -1315,7 +1587,7 @@ class GitManager(MSFluentWindow):
             ahead = int(ahead) if ahead.isdigit() else 0
             behind = int(behind) if behind.isdigit() else 0
 
-            remote, _, rc = self.run_git(repo, ["rev-parse", "--short", "@{u}"])
+            remote_commit, _, rc = self.run_git(repo, ["rev-parse", "--short", "@{u}"])
             if rc != 0:
                 status = "错误"
                 ahead_behind = "N/A"
@@ -1327,16 +1599,16 @@ class GitManager(MSFluentWindow):
                 ahead_behind = f"↑{ahead} ↓{behind}"
                 need_update = True
 
-            self.update_row_signal.emit(row, repo, branch, local or "N/A", remote or "N/A", status, ahead_behind)
+            self.update_row_signal.emit(row, repo, branch, local or "N/A", remote_commit or "N/A", status, ahead_behind, remote_url or "")
         except Exception as e:
             logger.error(f"加载失败 {repo}: {str(e)}")
-            self.update_row_signal.emit(row, repo, "N/A", "错误", "N/A", "错误", "N/A")
+            self.update_row_signal.emit(row, repo, "N/A", "错误", "N/A", "错误", "N/A", "")
         finally:
             if generation is not None:
                 self._mark_scan_progress(generation, need_update)
 
     def update_table_row(
-        self, row: int, repo: str, branch: str, local: str, remote: str, status: str, ahead_behind: str
+        self, row: int, repo: str, branch: str, local: str, remote_commit: str, status: str, ahead_behind: str, remote_url: str = ""
     ):
         if row >= self.table.rowCount():
             return
@@ -1345,23 +1617,24 @@ class GitManager(MSFluentWindow):
         old_check_state = old_check_item.checkState() if old_check_item else Qt.Unchecked
 
         check_item = QTableWidgetItem("")
-        check_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
-        check_item.setCheckState(old_check_state)
+        is_updatable = status == "可更新"
+        if is_updatable:
+            check_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+            check_item.setCheckState(old_check_state)
+        else:
+            check_item.setFlags(Qt.NoItemFlags)
+            check_item.setCheckState(Qt.Unchecked)
         check_item.setTextAlignment(Qt.AlignCenter)
         self.table.setItem(row, 0, check_item)
 
-        repo_item = QTableWidgetItem(os.path.basename(repo.rstrip("\\/")) or repo)
+        repo_name = os.path.basename(repo.rstrip("\\/")) or repo
+        repo_item = QTableWidgetItem(repo_name)
         repo_item.setData(Qt.UserRole, repo)
+        repo_item.setToolTip(repo)
         self.table.setItem(row, 1, repo_item)
 
-        for col, text in enumerate(
-            [
-                branch,
-                local,
-                remote,
-                f"{status}  {ahead_behind}" if ahead_behind not in ("N/A", "✓") else status,
-            ]
-        ):
+        status_text = f"{status}  {ahead_behind}" if ahead_behind not in ("N/A", "✓") else status
+        for col, text in enumerate([branch, local, remote_commit, status_text]):
             item = QTableWidgetItem(text)
             item.setTextAlignment(Qt.AlignCenter)
             self.table.setItem(row, col + 2, item)
@@ -1373,40 +1646,64 @@ class GitManager(MSFluentWindow):
         elif status == "✓ 已同步":
             status_item.setForeground(QColor("#00c853"))
 
-        # ====================== 关键修改：按钮状态控制 ======================
+        # 按钮状态控制
         btn = self.table.cellWidget(row, 6)
         if btn:
-            is_updatable = status == "可更新"
             btn.setEnabled(is_updatable)
             if not is_updatable:
                 btn.setStyleSheet("opacity: 0.5;")
             else:
                 btn.setStyleSheet("")
 
+        # 更新缓存
+        self._repo_cache[repo] = {
+            "name": repo_name,
+            "path": repo,
+            "remote_url": remote_url or "",
+            "branch": branch,
+            "local": local,
+            "remote": remote_commit,
+            "status": status,
+            "ahead_behind": ahead_behind,
+        }
+
     # ====================== 更新逻辑 ======================
     def pull_repo(self, repo: str, row: int):
+        repo_name = os.path.basename(repo.rstrip("\\/"))
         logger.info(f"[更新] {repo}")
 
         if os.path.exists(os.path.join(repo, ".git", "MERGE_HEAD")):
             logger.warning("存在未完成 merge，跳过")
-            self.load_repo_info(row, repo)
+            self.update_complete_signal.emit(repo_name, False, "存在未完成的 merge，请先处理后再更新。")
             return
 
         clean, _, _ = self.run_git(repo, ["status", "--porcelain"])
         if clean.strip():
             logger.warning("工作区有未提交更改，跳过")
-            self.load_repo_info(row, repo)
+            self.update_complete_signal.emit(repo_name, False, "工作区有未提交的更改，请先提交或暂存后再更新。")
             return
 
         out, err, code = self.run_git(repo, ["-c", "core.editor=true", "pull", "--rebase"])
 
+        self.load_repo_info(row, repo)
+
         if code == 0:
             logger.success(f"{repo} 更新成功")
+            self.update_complete_signal.emit(repo_name, True, "")
         else:
             logger.error(f"{repo} 更新失败\n{err}")
+            self.update_complete_signal.emit(repo_name, False, err[:200] if err else "更新过程中出现未知错误。")
 
-        # 刷新行（会重新设置按钮状态）
-        self.load_repo_info(row, repo)
+    def on_item_clicked(self, item):
+        row = item.row()
+        col = item.column()
+        repo_item = self.table.item(row, 1)
+        repo = repo_item.data(Qt.UserRole) if repo_item else ""
+
+        if col == 2:  # 当前分支 → 分支管理
+            BranchDialog(repo, self).exec()
+        elif col == 3:  # 当前版本 → 历史
+            HistoryDialog(repo, self).exec()
 
     def switch_to_commit(self, repo: str, commit: str, dialog=None):
         logger.warning(f"硬重置 {repo} → {commit}")
