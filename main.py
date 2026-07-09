@@ -1,183 +1,41 @@
-import json
 import os
-import re
-import shutil
 import stat
 import subprocess
 import sys
 import webbrowser
 
-if sys.version_info >= (3, 12):
-
-    def rmtree(path, ignore_errors=False, onerror=None, onexc=None):
-        return shutil.rmtree(path, ignore_errors=ignore_errors, onexc=onexc if onexc is not None else onerror)
-
-else:
-    import functools
-
-    @functools.wraps(shutil.rmtree)
-    def rmtree(path, ignore_errors=False, onerror=None, onexc=None):
-        handler = onexc if onexc is not None else onerror
-        kwargs = {"ignore_errors": ignore_errors}
-        if handler is not None:
-            kwargs["onerror"] = handler
-        return shutil.rmtree(path, **kwargs)
-
-
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
 
 from loguru import logger
-from PySide6.QtCore import QObject, QThread, Qt, Signal
-from PySide6.QtGui import QClipboard, QColor, QIcon, QTextCursor
+from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtGui import QColor, QIcon, QTextCursor
 from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog, QHBoxLayout,
                                QHeaderView, QTableWidget,
                                QTableWidgetItem, QVBoxLayout, QWidget)
 from qfluentwidgets import Action
 from qfluentwidgets import FluentIcon as FIF
-from qfluentwidgets import (HorizontalSeparator, IndeterminateProgressBar, InfoBar,
-                            LineEdit, MessageBox, MessageBoxBase,
+from qfluentwidgets import (HorizontalSeparator, InfoBar,
+                            MessageBox, MessageBoxBase,
                             MSFluentWindow, NavigationItemPosition,
                             PrimaryPushButton, PushButton, PushSettingCard,
                             RoundMenu, SearchLineEdit, SettingCardGroup,
-                            StrongBodyLabel, SubtitleLabel,
+                            StrongBodyLabel,
                             SwitchSettingCard, TableWidget, TextEdit, Theme,
                             ToolButton, ToolTipFilter, ToolTipPosition,
                             setTheme)
 
-
-from github_url_utils import normalize_github_url
-
 from res_rc import qInitResources
 
-logger.remove()
-
-
-def get_app_data_dir() -> Path:
-    try:
-        exe_path = Path(sys.argv[0]).resolve()
-        return exe_path.parent
-    except Exception:
-        return Path.cwd()
-
-
-APP_DATA_DIR = get_app_data_dir()
-CONFIG_FILE = APP_DATA_DIR / "config.json"
-REPO_CACHE_FILE = APP_DATA_DIR / "repo_cache.json"
-logger.add(
-    str(APP_DATA_DIR / "git_manager.log"), rotation="10 MB", retention="7 days", encoding="utf-8"
+from app.config import (
+    APP_DATA_DIR, CONFIG_FILE, REPO_CACHE_FILE,
+    load_config, save_config, load_repo_cache, save_repo_cache,
 )
-
-
-def load_repo_cache() -> list[dict]:
-    try:
-        if not REPO_CACHE_FILE.exists():
-            return []
-        with REPO_CACHE_FILE.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
-
-
-def save_repo_cache(data: list[dict]):
-    try:
-        with REPO_CACHE_FILE.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-
-def load_config() -> dict:
-    try:
-        if not CONFIG_FILE.exists():
-            return {}
-        with CONFIG_FILE.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception as e:
-        logger.warning(f"加载配置失败: {str(e)}")
-        return {}
-
-
-def save_config(config: dict):
-    try:
-        with CONFIG_FILE.open("w", encoding="utf-8") as f:
-            json.dump(config, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.warning(f"保存配置失败: {str(e)}")
-
-
-def build_hidden_subprocess_kwargs() -> dict:
-    kwargs = {}
-    if sys.platform == "win32":
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startupinfo.wShowWindow = 0
-        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-        kwargs["startupinfo"] = startupinfo
-    return kwargs
-
-
-def run_hidden(cmd, **kwargs):
-    hidden_kwargs = build_hidden_subprocess_kwargs()
-    for key, value in hidden_kwargs.items():
-        kwargs.setdefault(key, value)
-    return subprocess.run(cmd, **kwargs)
-
-
-@dataclass
-class GitRepoInfo:
-    url: str
-
-
-@dataclass
-class GitRepoCandidate:
-    name: str
-    path: str
-    is_git: bool
-    git_path: str
-
-
-def derive_repo_name(repo_input: str | GitRepoInfo) -> str:
-    url = repo_input.url if isinstance(repo_input, GitRepoInfo) else str(repo_input)
-    cleaned = url.strip().rstrip("/").rstrip("\\")
-    if not cleaned:
-        return ""
-
-    if cleaned.endswith(".git"):
-        cleaned = cleaned[:-4]
-
-    repo_name = os.path.basename(cleaned.replace(":", "/"))
-    return repo_name.strip()
-
-
-def build_clone_candidates(repo_input: str | GitRepoInfo) -> list[str]:
-    url = repo_input.url if isinstance(repo_input, GitRepoInfo) else str(repo_input)
-    primary = url.strip()
-    if not primary:
-        return []
-
-    candidates = [primary]
-    parsed = urlparse(primary)
-
-    if parsed.scheme in ("http", "https") and parsed.netloc.lower() == "github.com":
-        candidates.append(f"https://ghproxy.com/{primary}")
-    elif parsed.scheme in ("http", "https") and parsed.netloc.lower() == "gitee.com":
-        candidates.insert(0, primary)
-    elif parsed.scheme in ("http", "https") and parsed.netloc.lower() == "gitlab.com":
-        candidates.append(primary)
-
-    unique_candidates = []
-    for candidate in candidates:
-        if candidate not in unique_candidates:
-            unique_candidates.append(candidate)
-    return unique_candidates
-
-
+from core.git_runner import GitRunner
+from models.repo import GitRepoInfo, GitRepoCandidate
+from ui.dialogs.clone_dialog import CloneRepoDialog
+from utils.subprocess_utils import rmtree
 
 
 def safe_remove_repo_dir(base_path: str, repo_name: str, onerror=None) -> dict:
@@ -266,361 +124,6 @@ def scan_git_repos(base_path: str) -> list[GitRepoCandidate]:
     return candidates
 
 
-class CloneWorker(QObject):
-    """后台执行 git clone 的 Worker，通过信号通知 UI。"""
-    progress = Signal(str)        # 阶段描述
-    output = Signal(str)          # git 实时输出行
-    finished = Signal(bool, str)  # success, message
-
-    def __init__(self, url: str, base_dir: str, repo_name: str):
-        super().__init__()
-        self._url = url
-        self._base_dir = base_dir
-        self._repo_name = repo_name
-        self._process: subprocess.Popen | None = None
-        self._cancelled = False
-
-    def run(self):
-        """在后台线程中执行 git clone，实时输出日志。"""
-        try:
-            target_path = os.path.abspath(os.path.join(self._base_dir, self._repo_name))
-            if os.path.exists(target_path):
-                self.finished.emit(False, f"目录已存在: {self._repo_name}")
-                return
-
-            self.progress.emit("正在克隆...")
-            self.output.emit(f"> git clone --progress {self._url}")
-            self.output.emit(f"  目标目录: {target_path}")
-            self.output.emit("")
-
-            env = os.environ.copy()
-            env.setdefault("PYTHONIOENCODING", "utf-8")
-            env["GIT_TERMINAL_PROMPT"] = "0"
-
-            popen_kwargs = build_hidden_subprocess_kwargs()
-            self._process = subprocess.Popen(
-                ["git", "clone", "--progress", self._url, self._repo_name],
-                cwd=self._base_dir,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                **popen_kwargs,
-            )
-
-            assert self._process.stdout is not None
-            for line in self._process.stdout:
-                if self._cancelled:
-                    break
-                line_text = line.rstrip()
-                if line_text:
-                    self.output.emit(line_text)
-
-            self._process.wait()
-            code = self._process.returncode
-
-            if self._cancelled:
-                self.finished.emit(False, "克隆已取消")
-            elif code == 0:
-                self.finished.emit(True, f"仓库 {self._repo_name} 克隆成功")
-            else:
-                self.finished.emit(False, f"克隆失败 (退出码: {code})")
-
-        except FileNotFoundError:
-            self.finished.emit(False, "未找到 git 命令，请确认已安装 Git 并添加到系统 PATH")
-        except Exception as e:
-            logger.error(f"克隆异常: {str(e)}")
-            self.finished.emit(False, f"克隆异常: {str(e)}")
-        finally:
-            self._process = None
-
-    def cancel(self):
-        """请求取消克隆并终止子进程。"""
-        self._cancelled = True
-        if self._process and self._process.poll() is None:
-            try:
-                if sys.platform == "win32":
-                    run_hidden(
-                        ["taskkill", "/F", "/T", "/PID", str(self._process.pid)],
-                        check=False,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                else:
-                    self._process.terminate()
-                    try:
-                        self._process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        self._process.kill()
-            except Exception as e:
-                logger.debug(f"取消克隆进程失败: {str(e)}")
-
-
-class CloneRepoDialog(QDialog):
-    """克隆仓库对话框 —— 支持实时输出、连续克隆、线程安全。"""
-
-    def __init__(self, manager, parent=None):
-        super().__init__(parent)
-        self._manager = manager
-        self._worker: CloneWorker | None = None
-        self._thread: QThread | None = None
-        self._clone_running = False
-
-        self.setWindowTitle("克隆仓库")
-        self.resize(680, 560)
-
-        # ---- 主布局 ----
-        layout = QVBoxLayout(self)
-        layout.setSpacing(12)
-        layout.setContentsMargins(20, 20, 20, 20)
-
-        layout.addWidget(SubtitleLabel("克隆仓库"))
-
-        # ---- URL 输入行 ----
-        url_row = QHBoxLayout()
-        url_row.setSpacing(8)
-
-        self.urlLineEdit = LineEdit()
-        self.urlLineEdit.setPlaceholderText("输入 Git 仓库链接")
-        self.urlLineEdit.setClearButtonEnabled(True)
-        self.urlLineEdit.textChanged.connect(self._validate_url)
-        url_row.addWidget(self.urlLineEdit, 1)
-
-        self.paste_btn = ToolButton(FIF.PASTE)
-        ToolTipFilter(self.paste_btn, showDelay=300, position=ToolTipPosition.TOP)
-        self.paste_btn.setToolTip("从剪贴板粘贴")
-        self.paste_btn.clicked.connect(self._paste_from_clipboard)
-        url_row.addWidget(self.paste_btn)
-
-        self.format_btn = ToolButton(FIF.CODE)
-        ToolTipFilter(self.format_btn, showDelay=300, position=ToolTipPosition.TOP)
-        self.format_btn.setToolTip("自动格式化链接（例如 git clone 命令 → 纯 URL）")
-        self.format_btn.clicked.connect(self._format_url)
-        url_row.addWidget(self.format_btn)
-
-        layout.addLayout(url_row)
-
-        # ---- 仓库信息区域 ----
-        self._repo_name_label = StrongBodyLabel("仓库名称: -")
-        layout.addWidget(self._repo_name_label)
-
-        self._clone_dir_label = StrongBodyLabel("克隆目录: -")
-        layout.addWidget(self._clone_dir_label)
-
-        layout.addWidget(HorizontalSeparator())
-
-        # ---- 进度区域 ----
-        self._status_label = SubtitleLabel("状态: 就绪")
-        layout.addWidget(self._status_label)
-
-        self._progress_bar = IndeterminateProgressBar()
-        self._progress_bar.setVisible(False)
-        layout.addWidget(self._progress_bar)
-
-        # ---- 实时日志窗口 ----
-        layout.addWidget(StrongBodyLabel("实时日志"))
-        self._log_edit = TextEdit()
-        self._log_edit.setReadOnly(True)
-        self._log_edit.setPlaceholderText("克隆开始后，Git 输出将显示在此处...")
-        layout.addWidget(self._log_edit, 1)
-
-        # ---- 按钮区域 ----
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-
-        self._start_btn = PrimaryPushButton(FIF.DOWNLOAD, "开始克隆")
-        self._start_btn.setEnabled(False)
-        self._start_btn.clicked.connect(self._on_start_clone)
-        btn_row.addWidget(self._start_btn)
-
-        self._close_btn = PushButton(FIF.CLOSE, "关闭")
-        self._close_btn.clicked.connect(self._on_close_clicked)
-        btn_row.addWidget(self._close_btn)
-
-        layout.addLayout(btn_row)
-
-    # ---- 剪贴板粘贴 ----
-    def _paste_from_clipboard(self):
-        clipboard = QApplication.clipboard()
-        if clipboard:
-            text = clipboard.text().strip()
-            if text:
-                self.urlLineEdit.setText(text)
-
-    # ---- 自动格式化 ----
-    def _format_url(self):
-        raw = self.urlLineEdit.text().strip()
-        if not raw:
-            self._paste_from_clipboard()
-            raw = self.urlLineEdit.text().strip()
-            if not raw:
-                return
-
-        url = normalize_github_url(raw)
-        if url:
-            self.urlLineEdit.setText(url)
-        else:
-            InfoBar.warning("格式化失败", "无法识别为 GitHub 仓库地址，请检查输入", duration=4000, parent=self)
-
-    # ---- URL 验证 ----
-    def _validate_url(self):
-        if self._clone_running:
-            self._start_btn.setEnabled(False)
-            return
-        url = self.urlLineEdit.text().strip()
-        self._start_btn.setEnabled(bool(url))
-
-    def repo_url(self) -> str:
-        return self.urlLineEdit.text().strip()
-
-    # ---- 开始克隆 ----
-    def _on_start_clone(self):
-        raw_url = self.urlLineEdit.text().strip()
-        if not raw_url:
-            InfoBar.warning("提示", "请输入仓库链接", parent=self)
-            return
-
-        normalized = normalize_github_url(raw_url) or raw_url
-        repo_name = derive_repo_name(normalized)
-        if not repo_name:
-            InfoBar.warning("错误", "无法从 URL 解析仓库名称", parent=self)
-            return
-
-        base_abs = os.path.abspath(self._manager.base_dir)
-        target_path = os.path.join(base_abs, repo_name)
-        if os.path.exists(target_path):
-            InfoBar.error("克隆失败", f"目录已存在: {repo_name}", duration=5000, parent=self)
-            return
-
-        # 清理上一次残留的线程
-        if self._thread:
-            self._thread.quit()
-            self._thread.wait(2000)
-            self._thread = None
-
-        # 更新 UI 为克隆中状态
-        self._clone_running = True
-        self._set_cloning_ui(True)
-        self._repo_name_label.setText(f"仓库名称: {repo_name}")
-        self._clone_dir_label.setText(f"克隆目录: {target_path}")
-        self._log_edit.clear()
-        self._start_btn.setEnabled(False)
-        self.urlLineEdit.setEnabled(False)
-        self.paste_btn.setEnabled(False)
-        self.format_btn.setEnabled(False)
-        self._close_btn.setText("取消克隆")
-
-        # 创建 Worker 并移入 QThread
-        self._worker = CloneWorker(normalized, base_abs, repo_name)
-        self._thread = QThread()
-        self._worker.moveToThread(self._thread)
-
-        self._thread.started.connect(self._worker.run)
-        self._worker.progress.connect(self._on_progress)
-        self._worker.output.connect(self._on_output)
-        self._worker.finished.connect(self._on_finished)
-        self._worker.finished.connect(self._thread.quit)
-
-        self._thread.start()
-
-    def _set_cloning_ui(self, cloning: bool):
-        self._progress_bar.setVisible(cloning)
-        if cloning:
-            self._progress_bar.start()
-        else:
-            self._progress_bar.stop()
-
-    def _on_progress(self, phase: str):
-        self._status_label.setText(f"状态: {phase}")
-
-    def _on_output(self, text: str):
-        self._log_edit.append(text)
-        cursor = self._log_edit.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        self._log_edit.setTextCursor(cursor)
-
-    def _on_finished(self, success: bool, message: str):
-        self._clone_running = False
-        self._set_cloning_ui(False)
-
-        worker = self._worker
-        self._worker = None
-
-        # 恢复 UI
-        self._start_btn.setEnabled(True)
-        self.urlLineEdit.setEnabled(True)
-        self.paste_btn.setEnabled(True)
-        self.format_btn.setEnabled(True)
-        self._close_btn.setText("关闭")
-
-        if success:
-            self._status_label.setText("状态: 克隆完成")
-            InfoBar.success("克隆成功", message, duration=4000, parent=self)
-            # 自动添加到仓库列表
-            if worker and os.path.isdir(os.path.join(
-                os.path.abspath(os.path.join(worker._base_dir, worker._repo_name)), ".git"
-            )):
-                target_path = os.path.abspath(os.path.join(worker._base_dir, worker._repo_name))
-                self._manager._add_repo_row(target_path)
-                InfoBar.success(
-                    "已添加", f"{worker._repo_name} 已添加到仓库列表",
-                    duration=4000, parent=self._manager,
-                )
-            # 清空 URL 准备下一次克隆
-            self.urlLineEdit.clear()
-            self._repo_name_label.setText("仓库名称: -")
-            self._clone_dir_label.setText("克隆目录: -")
-            self._status_label.setText("状态: 就绪 — 可继续输入下一个仓库地址")
-        else:
-            self._status_label.setText("状态: 克隆失败")
-            InfoBar.error("克隆失败", message, duration=5000, parent=self)
-
-    # ---- 关闭 / 取消处理 ----
-    def _on_close_clicked(self):
-        if self._clone_running:
-            box = MessageBox(
-                "确认关闭", "克隆正在进行中，关闭窗口将中止克隆。\n确定要关闭吗？", self,
-            )
-            box.yesButton.setText("关闭并中止")
-            box.cancelButton.setText("取消")
-            if not box.exec():
-                return
-            self._stop_clone()
-        self.close()
-
-    def _stop_clone(self):
-        self._clone_running = False
-        if self._worker:
-            try:
-                self._worker.progress.disconnect()
-                self._worker.output.disconnect()
-                self._worker.finished.disconnect()
-            except Exception:
-                pass
-            self._worker.cancel()
-            self._worker = None
-        if self._thread:
-            self._thread.quit()
-            self._thread.wait(5000)
-            self._thread = None
-        # 恢复 UI
-        self._set_cloning_ui(False)
-        self._start_btn.setEnabled(True)
-        self.urlLineEdit.setEnabled(True)
-        self.paste_btn.setEnabled(True)
-        self.format_btn.setEnabled(True)
-        self._close_btn.setText("关闭")
-        self._status_label.setText("状态: 已取消")
-
-    def closeEvent(self, event):
-        if self._clone_running:
-            self._stop_clone()
-        super().closeEvent(event)
-
-
 class QtLogHandler(QObject):
     log_signal = Signal(str)
 
@@ -684,7 +187,7 @@ class HistoryDialog(QDialog):
         try:
             cmd = ["git", "log", "--pretty=format:%H|%ad|%an|%s", "--date=format:%Y-%m-%d %H:%M", "-30"]
 
-            result = run_hidden(
+            result = GitRunner.run_simple(
                 cmd,
                 cwd=self.repo_path,
                 capture_output=True,
@@ -796,7 +299,7 @@ class BranchDialog(QDialog):
 
     def load_branches(self):
         try:
-            run_hidden(
+            GitRunner.run_simple(
                 ["git", "fetch", "--quiet"],
                 cwd=self.repo_path,
                 capture_output=True,
@@ -805,7 +308,7 @@ class BranchDialog(QDialog):
                 encoding="utf-8",
                 errors="replace",
             )
-            current_result = run_hidden(
+            current_result = GitRunner.run_simple(
                 ["git", "branch", "--show-current"],
                 cwd=self.repo_path,
                 capture_output=True,
@@ -816,7 +319,7 @@ class BranchDialog(QDialog):
             )
             current_branch = current_result.stdout.strip() if current_result.returncode == 0 else ""
 
-            result = run_hidden(
+            result = GitRunner.run_simple(
                 [
                     "git",
                     "for-each-ref",
@@ -921,7 +424,7 @@ class GitManager(MSFluentWindow):
         super().__init__()
         qInitResources()
         setTheme(Theme.LIGHT)
-        run_hidden(["git", "config", "--global", "core.quotepath", "false"], check=False)
+        GitRunner.run_simple(["git", "config", "--global", "core.quotepath", "false"], check=False)
 
         self.setWindowTitle("Git 多仓库管理器 - 高级版")
         self.setWindowIcon(QIcon(":/icon.ico"))
@@ -932,9 +435,7 @@ class GitManager(MSFluentWindow):
         self.repos: list[str] = []
         self._repo_cache: dict[str, dict] = {}  # path -> cached info
         self.executor = ThreadPoolExecutor(max_workers=6)
-        self._is_closing = False
-        self._process_lock = threading.Lock()
-        self._active_processes: set[subprocess.Popen] = set()
+        self._git_runner = GitRunner()
         self._scan_lock = threading.Lock()
         self._scan_generation = 0
         self._scan_expected = 0
@@ -958,9 +459,9 @@ class GitManager(MSFluentWindow):
         save_config(self._config_cache)
 
     def closeEvent(self, event):
-        self._is_closing = True
+        self._git_runner.set_closing()
         self.executor.shutdown(wait=False, cancel_futures=True)
-        self._terminate_active_processes()
+        self._git_runner.terminate_active_processes()
         # 保存仓库缓存
         save_repo_cache(list(self._repo_cache.values()))
         logger.remove()
@@ -1243,79 +744,10 @@ class GitManager(MSFluentWindow):
             InfoBar.warning(title, content, parent=self)
 
     def run_git(self, path: str, args: list, timeout=60):
-        return self.run_command(["git"] + args, cwd=path, timeout=timeout)
+        return self._git_runner.run_git(path, args, timeout=timeout)
 
     def run_command(self, cmd: list[str], cwd: str | None = None, timeout=60, env: dict | None = None):
-        if self._is_closing:
-            return "", "Application is closing", -1
-
-        try:
-            process_env = os.environ.copy()
-            process_env.setdefault("PYTHONIOENCODING", "utf-8")
-            if env:
-                process_env.update(env)
-            popen_kwargs = build_hidden_subprocess_kwargs()
-
-            proc = subprocess.Popen(
-                cmd,
-                cwd=cwd,
-                env=process_env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                stdin=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                **popen_kwargs,
-            )
-            self._register_process(proc)
-
-            try:
-                stdout, stderr = proc.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                self._terminate_process(proc)
-                logger.error(f"命令执行超时: {' '.join(cmd)}")
-                return "", "Command timed out", -1
-            finally:
-                self._unregister_process(proc)
-
-            return (stdout or "").strip(), (stderr or "").strip(), proc.returncode
-
-        except Exception as e:
-            logger.error(f"命令执行失败: {str(e)}")
-            return "", str(e), -1
-
-    def _register_process(self, proc: subprocess.Popen):
-        with self._process_lock:
-            self._active_processes.add(proc)
-
-    def _unregister_process(self, proc: subprocess.Popen):
-        with self._process_lock:
-            self._active_processes.discard(proc)
-
-    def _terminate_process(self, proc: subprocess.Popen):
-        if proc.poll() is not None:
-            return
-
-        try:
-            if sys.platform == "win32":
-                run_hidden(
-                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                    check=False,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            else:
-                proc.kill()
-        except Exception as e:
-            logger.debug(f"结束进程失败 PID={proc.pid}: {str(e)}")
-
-    def _terminate_active_processes(self):
-        with self._process_lock:
-            processes = list(self._active_processes)
-
-        for proc in processes:
-            self._terminate_process(proc)
+        return self._git_runner.run_command(cmd, cwd=cwd, timeout=timeout, env=env)
 
     # ====================== 界面方法 ======================
     def select_folder(self):
@@ -1331,13 +763,13 @@ class GitManager(MSFluentWindow):
             proxy = self.load_proxy()
         proxy = proxy.strip()
         if proxy:
-            run_hidden(["git", "config", "--global", "http.proxy", proxy])
+            GitRunner.run_simple(["git", "config", "--global", "http.proxy", proxy])
             logger.success(f"代理已设置: {proxy}")
         else:
             self.clear_proxy()
 
     def clear_proxy(self):
-        run_hidden(["git", "config", "--global", "--unset", "http.proxy"])
+        GitRunner.run_simple(["git", "config", "--global", "--unset", "http.proxy"])
         logger.success("代理已清除")
 
     def select_settings_dir(self):
@@ -1575,74 +1007,13 @@ class GitManager(MSFluentWindow):
             return
         raise actual_exc
 
-    def clone_repo(self, repo_input: str | GitRepoInfo) -> dict:
-        result = self.clone_git_repo(repo_input, self.base_dir)
-        repo_name = derive_repo_name(repo_input)
-        target_path = os.path.abspath(os.path.join(self.base_dir, repo_name)) if repo_name else ""
-
-        if result["success"]:
-            logger.success(f"仓库克隆成功: {target_path or repo_name}")
-            if target_path and os.path.isdir(os.path.join(target_path, ".git")):
-                self._add_repo_row(target_path)
-                self.notify_signal.emit("success", "克隆成功", f"{repo_name} 已添加到列表")
-            else:
-                self.notify_signal.emit("success", "克隆成功", f"仓库已克隆到: {target_path}")
-        else:
-            error_message = result["error"] or "克隆失败"
-            logger.error(f"仓库克隆失败: {error_message}")
-            self.notify_signal.emit("error", "克隆失败", error_message[:200])
-
-        return result
-
-    def clone_git_repo(self, repo_input: str | GitRepoInfo, base_dir: str) -> dict:
-        repo_name = derive_repo_name(repo_input)
-        base_abs = os.path.abspath(base_dir)
-        target_path = os.path.abspath(os.path.join(base_abs, repo_name)) if repo_name else ""
-
-        if not repo_name:
-            return {"success": False, "error": "无法从 URL 解析仓库名称"}
-
-        if not os.path.exists(base_abs):
-            return {"success": False, "error": "base_dir 不存在"}
-
-        base_prefix = base_abs.rstrip("\\/") + os.sep
-        if not target_path.startswith(base_prefix):
-            return {"success": False, "error": "clone 目标路径不安全"}
-
-        if os.path.exists(target_path):
-            return {"success": False, "error": f"目录已存在: {repo_name}"}
-
-        candidates = build_clone_candidates(repo_input)
-        if not candidates:
-            return {"success": False, "error": "仓库地址不能为空"}
-
-        errors = []
-        for candidate in candidates:
-            logger.info(f"[克隆] 尝试源: {candidate}")
-            out, err, code = self.run_command(
-                ["git", "clone", candidate, target_path],
-                cwd=base_abs,
-                timeout=600,
-            )
-
-            if code == 0:
-                return {"success": True, "error": None}
-
-            errors.append(f"{candidate} -> {err or out or '克隆失败'}")
-            if os.path.exists(target_path):
-                try:
-                    rmtree(target_path, onerror=self._handle_remove_readonly)
-                except Exception as cleanup_error:
-                    errors.append(f"清理失败: {str(cleanup_error)}")
-                    break
-
-        return {"success": False, "error": " | ".join(errors)[:500] or "克隆失败"}
-
     def _add_update_button(self, row: int):
         """创建更新按钮（只显示图标）"""
         btn = ToolButton(FIF.UPDATE)
         btn.setFixedWidth(85)
-        ToolTipFilter(btn, showDelay=300, position=ToolTipPosition.TOP)
+        btn.installEventFilter(
+            ToolTipFilter(btn, 0, ToolTipPosition.BOTTOM)
+        )
         btn.setToolTip("更新仓库")
         btn.clicked.connect(lambda _, r=row: self.update_single_repo(r))
         self.table.takeItem(row, 6)

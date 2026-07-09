@@ -1,1 +1,0 @@
-from ._functools import cached_method
