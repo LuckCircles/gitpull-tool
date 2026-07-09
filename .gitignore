@@ -53,3 +53,6 @@ ENV/
 *.msi
 config.json
 *.log
+
+repo_cache.json
+reword.py
