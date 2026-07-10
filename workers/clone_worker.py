@@ -28,9 +28,9 @@ from utils.subprocess_utils import build_hidden_subprocess_kwargs, run_hidden
 class CloneWorker(QObject):
     """后台执行 git clone 的 Worker，通过信号通知 UI。"""
 
-    progress = Signal(str)         # 阶段描述
-    output = Signal(str)           # git 实时输出行
-    finished = Signal(bool, str)   # success, message
+    progress = Signal(str)  # 阶段描述
+    output = Signal(str)  # git 实时输出行
+    finished = Signal(bool, str)  # success, message
 
     def __init__(self, url: str, base_dir: str, repo_name: str):
         super().__init__()
@@ -91,7 +91,9 @@ class CloneWorker(QObject):
                 self.finished.emit(False, f"克隆失败 (退出码: {code})")
 
         except FileNotFoundError:
-            self.finished.emit(False, "未找到 git 命令，请确认已安装 Git 并添加到系统 PATH")
+            self.finished.emit(
+                False, "未找到 git 命令，请确认已安装 Git 并添加到系统 PATH"
+            )
         except Exception as e:
             logger.error(f"克隆异常: {str(e)}")
             self.finished.emit(False, f"克隆异常: {str(e)}")

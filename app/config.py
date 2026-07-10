@@ -27,7 +27,10 @@ CONFIG_FILE = APP_DATA_DIR / "config.json"
 REPO_CACHE_FILE = APP_DATA_DIR / "repo_cache.json"
 
 logger.add(
-    str(APP_DATA_DIR / "git_manager.log"), rotation="10 MB", retention="7 days", encoding="utf-8"
+    str(APP_DATA_DIR / "git_manager.log"),
+    rotation="10 MB",
+    retention="7 days",
+    encoding="utf-8",
 )
 
 

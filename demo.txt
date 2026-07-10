@@ -1,0 +1,3 @@
+self.select_file_button.installEventFilter(
+            ToolTipFilter(self.select_file_button, 0, ToolTipPosition.BOTTOM)
+        )

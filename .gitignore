@@ -13,7 +13,9 @@ env/
 ENV/
 .claude/
 .agents/
-
+.mypy_cache/
+.python-checkup-cache/
+.ruff_cache/
 # IDE
 .vscode/
 .idea/

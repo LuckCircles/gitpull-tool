@@ -13,7 +13,11 @@ import sys
 if sys.version_info >= (3, 12):
 
     def rmtree(path, ignore_errors=False, onerror=None, onexc=None):
-        return shutil.rmtree(path, ignore_errors=ignore_errors, onexc=onexc if onexc is not None else onerror)
+        return shutil.rmtree(
+            path,
+            ignore_errors=ignore_errors,
+            onexc=onexc if onexc is not None else onerror,
+        )
 
 else:
 

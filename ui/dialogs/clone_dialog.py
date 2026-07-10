@@ -19,11 +19,22 @@ import os
 from PySide6.QtCore import QThread
 from PySide6.QtGui import QIcon, QTextCursor
 from PySide6.QtWidgets import QApplication, QDialog, QHBoxLayout, QVBoxLayout
-from qfluentwidgets import (FluentIcon as FIF)
-from qfluentwidgets import (HorizontalSeparator, IndeterminateProgressBar, InfoBar,
-                            LineEdit, MessageBox, PrimaryPushButton, PushButton,
-                            StrongBodyLabel, SubtitleLabel, TextEdit,
-                            ToolButton, ToolTipFilter, ToolTipPosition)
+from qfluentwidgets import FluentIcon as FIF
+from qfluentwidgets import (
+    HorizontalSeparator,
+    IndeterminateProgressBar,
+    InfoBar,
+    LineEdit,
+    MessageBox,
+    PrimaryPushButton,
+    PushButton,
+    StrongBodyLabel,
+    SubtitleLabel,
+    TextEdit,
+    ToolButton,
+    ToolTipFilter,
+    ToolTipPosition,
+)
 
 from core.clone_manager import CloneManager
 from workers.clone_worker import CloneWorker
@@ -158,7 +169,12 @@ class CloneRepoDialog(QDialog):
             self.urlLineEdit.setText(url)
         elif url == raw:
             # normalize_github_url 返回 None，已 fallback 到原始输入
-            InfoBar.warning("格式化失败", "无法识别为 GitHub 仓库地址，请检查输入", duration=4000, parent=self)
+            InfoBar.warning(
+                "格式化失败",
+                "无法识别为 GitHub 仓库地址，请检查输入",
+                duration=4000,
+                parent=self,
+            )
 
     # ------------------------------------------------------------------
     # URL 验证
@@ -263,8 +279,10 @@ class CloneRepoDialog(QDialog):
             if worker and os.path.isdir(os.path.join(worker.target_path, ".git")):
                 self._manager._add_repo_row(worker.target_path)
                 InfoBar.success(
-                    "已添加", f"{worker._repo_name} 已添加到仓库列表",
-                    duration=4000, parent=self._manager,
+                    "已添加",
+                    f"{worker._repo_name} 已添加到仓库列表",
+                    duration=4000,
+                    parent=self._manager,
                 )
             # 清空 URL 准备下一次克隆
             self.urlLineEdit.clear()
@@ -281,7 +299,9 @@ class CloneRepoDialog(QDialog):
     def _on_close_clicked(self):
         if self._clone_running:
             box = MessageBox(
-                "确认关闭", "克隆正在进行中，关闭窗口将中止克隆。\n确定要关闭吗？", self,
+                "确认关闭",
+                "克隆正在进行中，关闭窗口将中止克隆。\n确定要关闭吗？",
+                self,
             )
             box.yesButton.setText("关闭并中止")
             box.cancelButton.setText("取消")

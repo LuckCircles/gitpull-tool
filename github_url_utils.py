@@ -18,40 +18,40 @@ from urllib.parse import unquote, urlparse
 
 # 匹配路径中出现的 "github.com/owner/repo" 形式（.git 可选，斜杠之后带 git 扩展的截断）
 _GITHUB_COM_PATH = re.compile(
-    r"github\.com/"                                # github.com/
-    r"([\w._-]+)"                                # owner (group 1)
+    r"github\.com/"  # github.com/
+    r"([\w._-]+)"  # owner (group 1)
     r"/"
-    r"([\w._-]+?)"                               # repo  (group 2)
-    r"(?:\.git)?"                                 # 可选 .git（不捕获）
-    r"(?=/|$|\s|'|\"|\\|[?#])",                  # 以 / $ \s 引号 # ? 终止
+    r"([\w._-]+?)"  # repo  (group 2)
+    r"(?:\.git)?"  # 可选 .git（不捕获）
+    r"(?=/|$|\s|'|\"|\\|[?#])",  # 以 / $ \s 引号 # ? 终止
 )
 
 # 匹配 SSH 风格: git@github.com:owner/repo.git
 _SSH_GITHUB = re.compile(
     r"git@github\.com:"
-    r"([\w._-]+)"                                # owner
+    r"([\w._-]+)"  # owner
     r"/"
-    r"([\w._-]+?)"                               # repo
+    r"([\w._-]+?)"  # repo
     r"(?:\.git)?(?=$|\s|'|\"|\\|[?#])",
 )
 
 # 匹配 git clone 命令：找到 git clone 之后第一个像 Git URL 的参数
 _GIT_CLONE_RE = re.compile(
     r"git\s+clone\s+"
-    r"(?:--[-\w]+\s+(?:\S+\s+)?)*"              # 跳过 --flag [value] 选项
-    r"['\"]?"                                      # 可选引号
-    r"("                                           # group 1: 实际 URL/SSH 地址
-    r"https?://\S+?"                               # HTTPS URL
+    r"(?:--[-\w]+\s+(?:\S+\s+)?)*"  # 跳过 --flag [value] 选项
+    r"['\"]?"  # 可选引号
+    r"("  # group 1: 实际 URL/SSH 地址
+    r"https?://\S+?"  # HTTPS URL
     r"|"
-    r"git@\S+?"                                    # SSH 地址
+    r"git@\S+?"  # SSH 地址
     r")"
-    r"['\"]?"                                       # 可选引号
-    r"(?:\s|$)",                                    # 以空格或结尾终止
+    r"['\"]?"  # 可选引号
+    r"(?:\s|$)",  # 以空格或结尾终止
 )
 
 # owner/repo 合法性（GitHub 用户名规则 + 常见仓库名规则）
-_VALID_OWNER = re.compile(r"^[\w](?:[\w.-]*[\w])?$")    # GitHub 用户名
-_VALID_REPO = re.compile(r"^[\w](?:[\w._-]*[\w])?$")     # 仓库名（允许 . _ -）
+_VALID_OWNER = re.compile(r"^[\w](?:[\w.-]*[\w])?$")  # GitHub 用户名
+_VALID_REPO = re.compile(r"^[\w](?:[\w._-]*[\w])?$")  # 仓库名（允许 . _ -）
 
 
 def normalize_github_url(raw: str) -> str | None:
@@ -161,17 +161,17 @@ def _extract_from_generic_path(text: str) -> tuple[str | None, str | None]:
     # 如果有 @ 前缀（SSH user@host），取 : 之后的部分；否则取整个
     if "@" in cleaned:
         idx = cleaned.rfind("@")
-        cleaned = cleaned[idx + 1:]
+        cleaned = cleaned[idx + 1 :]
 
     # 在剩余文本中搜索 owner/repo 模式
     # 格式: segment/segment 其中 segment 是合法 GitHub 用户名/仓库名
     pattern = re.compile(
-        r"(?:^|/|:\s*)"                         # 起始边界
-        r"([\w](?:[\w.-]*[\w])?)"                 # owner
+        r"(?:^|/|:\s*)"  # 起始边界
+        r"([\w](?:[\w.-]*[\w])?)"  # owner
         r"/"
-        r"([\w](?:[\w._-]*[\w])?)"                # repo
+        r"([\w](?:[\w._-]*[\w])?)"  # repo
         r"(?:\.git)?"
-        r"(?=/|$|\s|'|\"|\\|[?#])",                # 结束边界
+        r"(?=/|$|\s|'|\"|\\|[?#])",  # 结束边界
     )
 
     # 找所有匹配，取最佳候选
@@ -180,11 +180,31 @@ def _extract_from_generic_path(text: str) -> tuple[str | None, str | None]:
         repo = m.group(2)
         # 排除常见非仓库路径
         if owner.lower() in (
-            "api", "v1", "v2", "v3", "repos", "users", "orgs",
-            "search", "notifications", "settings", "login", "logout",
+            "api",
+            "v1",
+            "v2",
+            "v3",
+            "repos",
+            "users",
+            "orgs",
+            "search",
+            "notifications",
+            "settings",
+            "login",
+            "logout",
         ):
             continue
-        if repo.lower() in ("tree", "blob", "commits", "releases", "tags", "issues", "pulls", "wiki", "actions"):
+        if repo.lower() in (
+            "tree",
+            "blob",
+            "commits",
+            "releases",
+            "tags",
+            "issues",
+            "pulls",
+            "wiki",
+            "actions",
+        ):
             continue
         if _VALID_OWNER.match(owner) and _VALID_REPO.match(repo):
             return owner, repo
@@ -199,46 +219,72 @@ def _extract_from_generic_path(text: str) -> tuple[str | None, str | None]:
 if __name__ == "__main__":
     TEST_CASES = [
         # ---- 标准 GitHub URL ----
-        ("https://github.com/owner/repo",                "https://github.com/owner/repo.git"),
-        ("https://github.com/owner/repo.git",             "https://github.com/owner/repo.git"),
-        ("http://github.com/owner/repo",                  "https://github.com/owner/repo.git"),
-        ("github.com/owner/repo",                         "https://github.com/owner/repo.git"),
-        ("github.com/owner/repo.git",                     "https://github.com/owner/repo.git"),
-
+        ("https://github.com/owner/repo", "https://github.com/owner/repo.git"),
+        ("https://github.com/owner/repo.git", "https://github.com/owner/repo.git"),
+        ("http://github.com/owner/repo", "https://github.com/owner/repo.git"),
+        ("github.com/owner/repo", "https://github.com/owner/repo.git"),
+        ("github.com/owner/repo.git", "https://github.com/owner/repo.git"),
         # ---- SSH ----
-        ("git@github.com:owner/repo.git",                 "https://github.com/owner/repo.git"),
-        ("git@github.com:owner/repo",                     "https://github.com/owner/repo.git"),
-
+        ("git@github.com:owner/repo.git", "https://github.com/owner/repo.git"),
+        ("git@github.com:owner/repo", "https://github.com/owner/repo.git"),
         # ---- git clone 命令 ----
-        ("git clone https://github.com/owner/repo.git",   "https://github.com/owner/repo.git"),
-        ("git clone git@github.com:owner/repo.git",       "https://github.com/owner/repo.git"),
-        ("git clone --depth 1 https://github.com/a/b.git", "https://github.com/a/b.git"),
-
+        (
+            "git clone https://github.com/owner/repo.git",
+            "https://github.com/owner/repo.git",
+        ),
+        (
+            "git clone git@github.com:owner/repo.git",
+            "https://github.com/owner/repo.git",
+        ),
+        (
+            "git clone --depth 1 https://github.com/a/b.git",
+            "https://github.com/a/b.git",
+        ),
         # ---- 常见镜像/代理 ----
-        ("https://githubfast.com/owner/repo.git",         "https://github.com/owner/repo.git"),
-        ("https://ghfast.top/https://github.com/owner/repo.git", "https://github.com/owner/repo.git"),
-        ("https://gitclone.com/github.com/owner/repo.git","https://github.com/owner/repo.git"),
-        ("https://wget.la/https://github.com/owner/repo.git", "https://github.com/owner/repo.git"),
-
+        ("https://githubfast.com/owner/repo.git", "https://github.com/owner/repo.git"),
+        (
+            "https://ghfast.top/https://github.com/owner/repo.git",
+            "https://github.com/owner/repo.git",
+        ),
+        (
+            "https://gitclone.com/github.com/owner/repo.git",
+            "https://github.com/owner/repo.git",
+        ),
+        (
+            "https://wget.la/https://github.com/owner/repo.git",
+            "https://github.com/owner/repo.git",
+        ),
         # ---- 带 query / fragment ----
-        ("https://github.com/owner/repo?tab=readme",      "https://github.com/owner/repo.git"),
-        ("https://github.com/owner/repo.git#readme",      "https://github.com/owner/repo.git"),
-
+        (
+            "https://github.com/owner/repo?tab=readme",
+            "https://github.com/owner/repo.git",
+        ),
+        (
+            "https://github.com/owner/repo.git#readme",
+            "https://github.com/owner/repo.git",
+        ),
         # ---- 特殊仓库名 ----
-        ("https://github.com/user123/my-repo",            "https://github.com/user123/my-repo.git"),
-        ("https://github.com/user/repo_with_underscore",  "https://github.com/user/repo_with_underscore.git"),
-        ("https://github.com/user/repo.v2.git",           "https://github.com/user/repo.v2.git"),
-
+        (
+            "https://github.com/user123/my-repo",
+            "https://github.com/user123/my-repo.git",
+        ),
+        (
+            "https://github.com/user/repo_with_underscore",
+            "https://github.com/user/repo_with_underscore.git",
+        ),
+        ("https://github.com/user/repo.v2.git", "https://github.com/user/repo.v2.git"),
         # ---- sub-group / 多级路径（非 GitHub 标准，但可处理）----
-        ("https://github.com/owner/repo/tree/main",       "https://github.com/owner/repo.git"),
-
+        (
+            "https://github.com/owner/repo/tree/main",
+            "https://github.com/owner/repo.git",
+        ),
         # ---- 无法识别 ----
-        ("https://gitlab.com/owner/repo.git",             None),
-        ("https://gitee.com/owner/repo.git",              None),
-        ("not a url",                                     None),
-        ("",                                              None),
-        (None,                                            None),
-        ("   ",                                           None),
+        ("https://gitlab.com/owner/repo.git", None),
+        ("https://gitee.com/owner/repo.git", None),
+        ("not a url", None),
+        ("", None),
+        (None, None),
+        ("   ", None),
     ]
 
     passed = 0

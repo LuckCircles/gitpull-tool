@@ -2,40 +2,60 @@ import os
 import stat
 import subprocess
 import sys
-import webbrowser
-
 import threading
+import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from loguru import logger
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, Qt, QThread, Signal
 from PySide6.QtGui import QColor, QIcon, QTextCursor
-from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog, QHBoxLayout,
-                               QHeaderView, QTableWidget,
-                               QTableWidgetItem, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QHBoxLayout,
+    QHeaderView,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
 from qfluentwidgets import Action
 from qfluentwidgets import FluentIcon as FIF
-from qfluentwidgets import (HorizontalSeparator, InfoBar,
-                            MessageBox, MessageBoxBase,
-                            MSFluentWindow, NavigationItemPosition,
-                            PrimaryPushButton, PushButton, PushSettingCard,
-                            RoundMenu, SearchLineEdit, SettingCardGroup,
-                            StrongBodyLabel,
-                            SwitchSettingCard, TableWidget, TextEdit, Theme,
-                            ToolButton, ToolTipFilter, ToolTipPosition,
-                            setTheme)
-
-from res_rc import qInitResources
-
-from app.config import (
-    APP_DATA_DIR, CONFIG_FILE, REPO_CACHE_FILE,
-    load_config, save_config, load_repo_cache, save_repo_cache,
+from qfluentwidgets import (
+    HorizontalSeparator,
+    InfoBar,
+    MessageBoxBase,
+    MSFluentWindow,
+    NavigationItemPosition,
+    PrimaryPushButton,
+    PushButton,
+    PushSettingCard,
+    RoundMenu,
+    SearchLineEdit,
+    SettingCardGroup,
+    StrongBodyLabel,
+    SwitchSettingCard,
+    TableWidget,
+    TextEdit,
+    Theme,
+    ToolButton,
+    ToolTipFilter,
+    ToolTipPosition,
+    setTheme,
 )
+
+from app.config import load_config, save_config, save_repo_cache
 from core.git_runner import GitRunner
-from models.repo import GitRepoInfo, GitRepoCandidate
+from models.repo import GitRepoCandidate
+from res_rc import qInitResources
+from ui.dialogs.branch_dialog import BranchDialog
 from ui.dialogs.clone_dialog import CloneRepoDialog
+from ui.dialogs.delete_dialog import DeleteRepoDialog
+from ui.dialogs.history_dialog import HistoryDialog
+from ui.dialogs.rename_dialog import RenameRepoDialog
 from utils.subprocess_utils import rmtree
+from workers.proxy_verify_worker import ProxyVerifyWorker
 
 
 def safe_remove_repo_dir(base_path: str, repo_name: str, onerror=None) -> dict:
@@ -75,6 +95,28 @@ def safe_remove_repo_dir(base_path: str, repo_name: str, onerror=None) -> dict:
 
     try:
         rmtree(target_abs, onerror=onerror)
+        result["success"] = True
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
+
+def safe_remove_git_only(repo_path: str, onerror=None) -> dict:
+    """删除仓库中的.git文件夹，保留其他文件"""
+    result = {"success": False, "error": None}
+
+    repo_abs = os.path.abspath(repo_path)
+    if not os.path.isdir(repo_abs):
+        result["error"] = "仓库路径不存在"
+        return result
+
+    git_dir = os.path.join(repo_abs, ".git")
+    if not os.path.exists(git_dir):
+        result["error"] = ".git 文件夹不存在"
+        return result
+
+    try:
+        rmtree(git_dir, onerror=onerror)
         result["success"] = True
     except Exception as e:
         result["error"] = str(e)
@@ -142,289 +184,24 @@ class QtLogHandler(QObject):
         self.text_edit.setTextCursor(cursor)
 
 
-# ====================== 版本历史弹窗 ======================
-class HistoryDialog(QDialog):
-    def __init__(self, repo_path: str, parent=None):
-        super().__init__(parent)
-        self.repo_path = repo_path
-        self.setWindowTitle(f"版本历史 - {os.path.basename(repo_path)}")
-        self.resize(980, 680)
-
-        layout = QVBoxLayout(self)
-        layout.setSpacing(12)
-        layout.setContentsMargins(16, 16, 16, 16)
-
-        layout.addWidget(StrongBodyLabel(f"仓库: {repo_path}"))
-
-        self.table = TableWidget()
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["Commit", "日期", "作者", "提交信息"])
-        self.table.verticalHeader().setVisible(False)  # 去掉左侧序号列
-
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
-
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.table.itemDoubleClicked.connect(self.on_double_click)
-        layout.addWidget(self.table)
-
-        btn_layout = QHBoxLayout()
-        self.switch_btn = PrimaryPushButton(FIF.UPDATE, "切换版本")
-        self.switch_btn.clicked.connect(self.switch_to_version)
-        self.close_btn = PushButton(FIF.CLOSE, "关闭窗口")
-        self.close_btn.clicked.connect(self.close)
-        btn_layout.addStretch()
-        btn_layout.addWidget(self.switch_btn)
-        btn_layout.addWidget(self.close_btn)
-        layout.addLayout(btn_layout)
-
-        self.load_history()
-
-    def load_history(self):
-        try:
-            cmd = ["git", "log", "--pretty=format:%H|%ad|%an|%s", "--date=format:%Y-%m-%d %H:%M", "-30"]
-
-            result = GitRunner.run_simple(
-                cmd,
-                cwd=self.repo_path,
-                capture_output=True,
-                text=True,
-                timeout=15,
-                encoding="utf-8",
-                errors="replace",
-            )
-
-            if result.returncode != 0:
-                return
-
-            self.table.setRowCount(0)
-            for line in result.stdout.strip().split('\n'):
-                if not line.strip():
-                    continue
-                commit, date, author, message = line.split('|', 3)
-
-                item_commit = QTableWidgetItem(commit[:12])  # 显示短 hash
-                item_commit.setData(Qt.UserRole, commit)
-                row = self.table.rowCount()
-                self.table.insertRow(row)
-                self.table.setItem(row, 0, item_commit)
-                self.table.setItem(row, 1, QTableWidgetItem(date))
-                self.table.setItem(row, 2, QTableWidgetItem(author))
-                self.table.setItem(row, 3, QTableWidgetItem(message))
-
-                if row == 0:
-                    for col in range(4):
-                        item = self.table.item(row, col)
-                        if item:
-                            item.setBackground(QColor(0, 120, 215, 40))
-                            font = item.font()
-                            font.setBold(True)
-                            item.setFont(font)
-        except Exception as e:
-            logger.error(f"加载历史失败: {str(e)}")
-
-    def on_double_click(self, item):
-        self.switch_to_version()
-
-    def switch_to_version(self):
-        selected = self.table.selectedItems()
-        if not selected:
-            return
-
-        row = selected[0].row()
-
-        item = self.table.item(row, 0)
-
-        # ✅ 优先用完整 commit
-        commit = item.data(Qt.UserRole)
-        if not commit:
-            commit = item.text()  # fallback（防止旧数据）
-
-        box = MessageBox(
-            "确认切换版本", f"确定要切换到该版本？\n\nCommit: {commit[:12]}\n\n⚠ 此操作会丢弃所有未提交更改！", self
-        )
-
-        box.yesButton.setText("切换")
-        box.cancelButton.setText("取消")
-        box.cancelButton.setFocus()
-
-        if box.exec():
-            self.parent().switch_to_commit(self.repo_path, commit, self)
-
-
-# ====================== 分支列表弹窗 ======================
-class BranchDialog(QDialog):
-    def __init__(self, repo_path: str, parent=None):
-        super().__init__(parent)
-        self.repo_path = repo_path
-        self.setWindowTitle(f"分支管理 - {os.path.basename(repo_path)}")
-        self.resize(860, 560)
-
-        layout = QVBoxLayout(self)
-        layout.setSpacing(12)
-        layout.setContentsMargins(16, 16, 16, 16)
-
-        layout.addWidget(StrongBodyLabel(f"仓库: {repo_path}"))
-
-        self.table = TableWidget()
-        self.table.setColumnCount(5)
-        self.table.setHorizontalHeaderLabels(["分支", "类型", "当前", "最新提交", "提交信息"])
-        self.table.verticalHeader().setVisible(False)
-
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
-
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.table.itemDoubleClicked.connect(self.on_double_click)
-        layout.addWidget(self.table)
-
-        btn_layout = QHBoxLayout()
-        self.switch_btn = PrimaryPushButton(FIF.UPDATE, "切换分支")
-        self.switch_btn.clicked.connect(self.switch_to_branch)
-        self.close_btn = PushButton(FIF.CLOSE, "关闭窗口")
-        self.close_btn.clicked.connect(self.close)
-        btn_layout.addStretch()
-        btn_layout.addWidget(self.switch_btn)
-        btn_layout.addWidget(self.close_btn)
-        layout.addLayout(btn_layout)
-
-        self.load_branches()
-
-    def load_branches(self):
-        try:
-            GitRunner.run_simple(
-                ["git", "fetch", "--quiet"],
-                cwd=self.repo_path,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                encoding="utf-8",
-                errors="replace",
-            )
-            current_result = GitRunner.run_simple(
-                ["git", "branch", "--show-current"],
-                cwd=self.repo_path,
-                capture_output=True,
-                text=True,
-                timeout=15,
-                encoding="utf-8",
-                errors="replace",
-            )
-            current_branch = current_result.stdout.strip() if current_result.returncode == 0 else ""
-
-            result = GitRunner.run_simple(
-                [
-                    "git",
-                    "for-each-ref",
-                    "--format=%(refname)|%(refname:short)|%(objectname:short)|%(committerdate:format:%Y-%m-%d %H:%M)|%(subject)",
-                    "refs/heads",
-                    "refs/remotes",
-                ],
-                cwd=self.repo_path,
-                capture_output=True,
-                text=True,
-                timeout=15,
-                encoding="utf-8",
-                errors="replace",
-            )
-
-            if result.returncode != 0:
-                return
-
-            self.table.setRowCount(0)
-            for line in result.stdout.strip().split("\n"):
-                if not line.strip():
-                    continue
-
-                refname, short_name, commit, date, message = line.split("|", 4)
-                if refname.startswith("refs/remotes/") and refname.endswith("/HEAD"):
-                    continue
-
-                is_remote = refname.startswith("refs/remotes/")
-                branch_type = "远程" if is_remote else "本地"
-                is_current = not is_remote and short_name == current_branch
-
-                branch_item = QTableWidgetItem(short_name)
-                branch_item.setData(
-                    Qt.UserRole,
-                    {
-                        "name": short_name,
-                        "refname": refname,
-                        "is_remote": is_remote,
-                    },
-                )
-
-                row = self.table.rowCount()
-                self.table.insertRow(row)
-                self.table.setItem(row, 0, branch_item)
-                self.table.setItem(row, 1, QTableWidgetItem(branch_type))
-                self.table.setItem(row, 2, QTableWidgetItem("✓" if is_current else ""))
-                self.table.setItem(row, 3, QTableWidgetItem(f"{commit}  {date}".strip()))
-                self.table.setItem(row, 4, QTableWidgetItem(message))
-
-                if is_current:
-                    for col in range(5):
-                        item = self.table.item(row, col)
-                        if item:
-                            item.setBackground(QColor(0, 120, 215, 40))
-                            font = item.font()
-                            font.setBold(True)
-                            item.setFont(font)
-        except Exception as e:
-            logger.error(f"加载分支失败: {str(e)}")
-
-    def on_double_click(self, item):
-        self.switch_to_branch()
-
-    def switch_to_branch(self):
-        selected = self.table.selectedItems()
-        if not selected:
-            return
-
-        row = selected[0].row()
-        item = self.table.item(row, 0)
-        branch_info = item.data(Qt.UserRole) if item else None
-        if not branch_info:
-            return
-
-        branch_name = branch_info["name"]
-        branch_type = "远程分支" if branch_info["is_remote"] else "本地分支"
-
-        box = MessageBox(
-            "确认切换分支",
-            f"确定要切换到该{branch_type}？\n\n分支: {branch_name}\n\n未提交的更改可能导致切换失败，请先确认工作区状态。",
-            self,
-        )
-
-        box.yesButton.setText("切换")
-        box.cancelButton.setText("取消")
-        box.cancelButton.setFocus()
-
-        if box.exec():
-            self.parent().switch_to_branch(self.repo_path, branch_info, self)
-
-
 # ====================== 主窗口 ======================
 class GitManager(MSFluentWindow):
     update_row_signal = Signal(
         int, str, str, str, str, str, str, str
     )  # row, repo, branch, local, remote_commit, status, ahead_behind, remote_url
     notify_signal = Signal(str, str, str)
-    scan_summary_signal = Signal(int, int, int)  # need_update_count, ignored_count, total_count
+    scan_summary_signal = Signal(
+        int, int, int
+    )  # need_update_count, ignored_count, total_count
     update_complete_signal = Signal(str, bool, str)  # repo_name, success, message
 
     def __init__(self):
         super().__init__()
         qInitResources()
         setTheme(Theme.LIGHT)
-        GitRunner.run_simple(["git", "config", "--global", "core.quotepath", "false"], check=False)
+        GitRunner.run_simple(
+            ["git", "config", "--global", "core.quotepath", "false"], check=False
+        )
 
         self.setWindowTitle("Git 多仓库管理器 - 高级版")
         self.setWindowIcon(QIcon(":/icon.ico"))
@@ -442,13 +219,16 @@ class GitManager(MSFluentWindow):
         self._scan_done = 0
         self._scan_need_update = 0
         self._scan_ignored = 0
+        self._proxy_verify_thread = None  # 代理验证线程
 
         self.init_ui()
         self.apply_proxy(self.load_proxy())
 
         self.qt_handler = QtLogHandler(self.log_text)
         logger.add(
-            self.qt_handler.write, level="DEBUG", format="{time:HH:mm:ss} | <level>{level:8}</level> | {message}"
+            self.qt_handler.write,
+            level="DEBUG",
+            format="{time:HH:mm:ss} | <level>{level:8}</level> | {message}",
         )
         logger.success("Git 多仓库管理器启动成功")
 
@@ -589,7 +369,9 @@ class GitManager(MSFluentWindow):
 
         self.table = TableWidget()
         self.table.setColumnCount(7)
-        self.table.setHorizontalHeaderLabels(["", "仓库名称", "当前分支", "当前版本", "最新版本", "状态 / 同步", "操作"])
+        self.table.setHorizontalHeaderLabels(
+            ["", "仓库名称", "当前分支", "当前版本", "最新版本", "状态 / 同步", "操作"]
+        )
 
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Fixed)
@@ -657,6 +439,17 @@ class GitManager(MSFluentWindow):
         self.proxy_card.clicked.connect(self._edit_proxy)
         self.network_group.addSettingCard(self.proxy_card)
 
+        # 验证代理卡片
+        self.verify_proxy_card = PushSettingCard(
+            "验证连接",
+            FIF.PLAY,
+            "验证代理",
+            "验证代理配置和 GitHub 连接性",
+            self.network_group,
+        )
+        self.verify_proxy_card.clicked.connect(self.verify_proxy_settings)
+        self.network_group.addSettingCard(self.verify_proxy_card)
+
         self.token_card = PushSettingCard(
             "点击编辑",
             FIF.HEART,
@@ -691,7 +484,11 @@ class GitManager(MSFluentWindow):
             self.about_group,
         )
         self.about_card.clicked.connect(
-            lambda: InfoBar.info("关于", "Git 多仓库管理器 v2.0\n基于 PySide6 + FluentWidgets 构建", parent=self)
+            lambda: InfoBar.info(
+                "关于",
+                "Git 多仓库管理器 v2.0\n基于 PySide6 + FluentWidgets 构建",
+                parent=self,
+            )
         )
         self.about_group.addSettingCard(self.about_card)
         settings_layout.addWidget(self.about_group)
@@ -718,7 +515,12 @@ class GitManager(MSFluentWindow):
 
         self.addSubInterface(self.repo_page, FIF.HOME, "仓库")
         self.addSubInterface(self.log_page, FIF.DOCUMENT, "日志")
-        self.addSubInterface(self.settings_page, FIF.SETTING, "设置", position=NavigationItemPosition.BOTTOM)
+        self.addSubInterface(
+            self.settings_page,
+            FIF.SETTING,
+            "设置",
+            position=NavigationItemPosition.BOTTOM,
+        )
 
         self.update_row_signal.connect(self.update_table_row)
         self.notify_signal.connect(self.show_notification)
@@ -746,7 +548,13 @@ class GitManager(MSFluentWindow):
     def run_git(self, path: str, args: list, timeout=60):
         return self._git_runner.run_git(path, args, timeout=timeout)
 
-    def run_command(self, cmd: list[str], cwd: str | None = None, timeout=60, env: dict | None = None):
+    def run_command(
+        self,
+        cmd: list[str],
+        cwd: str | None = None,
+        timeout=60,
+        env: dict | None = None,
+    ):
         return self._git_runner.run_command(cmd, cwd=cwd, timeout=timeout, env=env)
 
     # ====================== 界面方法 ======================
@@ -857,7 +665,11 @@ class GitManager(MSFluentWindow):
         if not token:
             return "未设置"
         if len(token) <= 8:
-            return token[:2] + "*" * (len(token) - 4) + token[-2:] if len(token) >= 4 else "****"
+            return (
+                token[:2] + "*" * (len(token) - 4) + token[-2:]
+                if len(token) >= 4
+                else "****"
+            )
         return token[:4] + "*" * (len(token) - 8) + token[-4:]
 
     def _filter_repos(self, keyword: str):
@@ -891,17 +703,23 @@ class GitManager(MSFluentWindow):
             row = self.table.rowCount()
             self.table.insertRow(row)
             for c in range(7):
-                self.table.setItem(row, c, QTableWidgetItem("..."))
-            self._add_update_button(row)
+                item = QTableWidgetItem("...")
+                # 在第1列设置repo_path作为UserRole数据
+                if c == 1:
+                    item.setData(Qt.UserRole, candidate.path)
+                self.table.setItem(row, c, item)
+            self._add_update_button(row, candidate.path)
 
         if not repo_candidates:
             self.scan_summary_signal.emit(0, 0, 0)
             return
 
-        for i, repo in enumerate(self.repos):
-            self.executor.submit(self.load_repo_info, i, repo, generation)
+        for repo in self.repos:
+            self.executor.submit(self.load_repo_info, repo, generation)
 
-    def _mark_scan_progress(self, generation: int, need_update: bool, ignored: bool = False):
+    def _mark_scan_progress(
+        self, generation: int, need_update: bool, ignored: bool = False
+    ):
         with self._scan_lock:
             if generation != self._scan_generation:
                 return
@@ -913,9 +731,13 @@ class GitManager(MSFluentWindow):
                 self._scan_ignored += 1
 
             if self._scan_done == self._scan_expected:
-                self.scan_summary_signal.emit(self._scan_need_update, self._scan_ignored, self._scan_expected)
+                self.scan_summary_signal.emit(
+                    self._scan_need_update, self._scan_ignored, self._scan_expected
+                )
 
-    def show_scan_summary(self, need_update_count: int, ignored_count: int, total_count: int):
+    def show_scan_summary(
+        self, need_update_count: int, ignored_count: int, total_count: int
+    ):
         parts = [f"共扫描 {total_count} 个仓库"]
         if need_update_count > 0:
             parts.append(f"需要更新 {need_update_count} 个")
@@ -932,9 +754,16 @@ class GitManager(MSFluentWindow):
 
     def show_update_complete(self, repo_name: str, success: bool, message: str):
         if success:
-            InfoBar.success("更新成功", f"{repo_name} 已是最新版本", duration=4000, parent=self)
+            InfoBar.success(
+                "更新成功", f"{repo_name} 已是最新版本", duration=4000, parent=self
+            )
         else:
-            InfoBar.error("更新失败", f"{repo_name} 更新失败。\n{message}", duration=5000, parent=self)
+            InfoBar.error(
+                "更新失败",
+                f"{repo_name} 更新失败。\n{message}",
+                duration=5000,
+                parent=self,
+            )
 
     def show_clone_dialog(self):
         """打开克隆仓库对话框，对话框内部管理整个克隆生命周期。"""
@@ -963,39 +792,7 @@ class GitManager(MSFluentWindow):
             InfoBar.warning("提示", "请先选中一个仓库", parent=self)
             return
 
-        repo_name = os.path.basename(repo.rstrip("\\/"))
-        expected_target = os.path.abspath(os.path.join(os.path.abspath(self.base_dir), repo_name))
-        selected_target = os.path.abspath(repo)
-        if selected_target != expected_target:
-            InfoBar.error("失败", "只允许删除当前基础目录下的直属仓库目录", parent=self)
-            logger.error(f"拒绝删除非直属仓库目录: selected={selected_target}, expected={expected_target}")
-            return
-
-        box = MessageBox("确认删除仓库", f"确定删除本地仓库？\n\n{repo}", self)
-        box.yesButton.setText("删除")
-        box.cancelButton.setText("取消")
-        if not box.exec():
-            return
-
-        try:
-            result = safe_remove_repo_dir(self.base_dir, repo_name, onerror=self._handle_remove_readonly)
-            if result["success"]:
-                logger.success(f"已删除仓库: {selected_target}")
-                # 直接从表格和缓存移除该行
-                self.table.removeRow(row)
-                try:
-                    self.repos.remove(repo)
-                except ValueError:
-                    pass
-                self._remove_ignored_record(repo)
-                self._save_cached_config()
-                InfoBar.success("成功", "仓库已删除", parent=self)
-            else:
-                logger.error(f"删除仓库失败: {result['error']}")
-                InfoBar.error("失败", (result["error"] or "删除失败")[:150], parent=self)
-        except Exception as e:
-            logger.error(f"删除仓库失败: {str(e)}")
-            InfoBar.error("失败", str(e)[:150], parent=self)
+        self._context_delete_repo(repo)
 
     @staticmethod
     def _handle_remove_readonly(func, path, exc):
@@ -1007,15 +804,24 @@ class GitManager(MSFluentWindow):
             return
         raise actual_exc
 
-    def _add_update_button(self, row: int):
-        """创建更新按钮（只显示图标）"""
+    def get_row_by_repo_path(self, repo_path: str) -> int:
+        """根据repo_path查找当前表格中的行号。不存在返回-1"""
+        repo_path = os.path.abspath(repo_path)
+        for row in range(self.table.rowCount()):
+            repo_item = self.table.item(row, 1)
+            if repo_item:
+                item_repo = repo_item.data(Qt.UserRole)
+                if item_repo and os.path.abspath(item_repo) == repo_path:
+                    return row
+        return -1
+
+    def _add_update_button(self, row: int, repo_path: str):
+        """创建更新按钮（只显示图标）。使用repo_path而不是row作为标识"""
         btn = ToolButton(FIF.UPDATE)
         btn.setFixedWidth(85)
-        btn.installEventFilter(
-            ToolTipFilter(btn, 0, ToolTipPosition.BOTTOM)
-        )
+        btn.installEventFilter(ToolTipFilter(btn, 0, ToolTipPosition.BOTTOM))
         btn.setToolTip("更新仓库")
-        btn.clicked.connect(lambda _, r=row: self.update_single_repo(r))
+        btn.clicked.connect(lambda: self.update_single_repo(repo_path))
         self.table.takeItem(row, 6)
         self.table.setCellWidget(row, 6, btn)
         return btn
@@ -1030,17 +836,20 @@ class GitManager(MSFluentWindow):
         self.table.insertRow(row)
         for c in range(7):
             self.table.setItem(row, c, QTableWidgetItem("..."))
-        self._add_update_button(row)
+        self._add_update_button(row, repo_path)
         # 撤销搜索过滤确保新行可见
         self.search_edit.clear()
         # 加载仓库信息
-        self.executor.submit(self.load_repo_info, row, repo_path, None)
+        self.executor.submit(self.load_repo_info, repo_path, None)
 
-    def update_single_repo(self, row: int):
-        item = self.table.item(row, 1)
-        repo = item.data(Qt.UserRole) if item else ""
-        if repo:
-            self.executor.submit(self.pull_repo, repo, row)
+    def update_single_repo(self, repo_path: str):
+        """通过repo_path更新单个仓库。自动查找当前行号"""
+        repo_path = os.path.abspath(repo_path)
+        row = self.get_row_by_repo_path(repo_path)
+        if row == -1:
+            logger.warning(f"未找到仓库行: {repo_path}")
+            return
+        self.executor.submit(self.pull_repo, repo_path)
 
     def get_checked_repos(self) -> list[tuple[int, str]]:
         checked: list[tuple[int, str]] = []
@@ -1068,20 +877,32 @@ class GitManager(MSFluentWindow):
                 logger.info(f"[跳过更新] {repo_name} 已设置忽略更新")
                 skipped += 1
             else:
-                to_update.append((row, repo))
+                to_update.append(repo)
 
         if skipped:
-            InfoBar.warning("跳过已忽略", f"已跳过 {skipped} 个忽略更新的仓库", duration=4000, parent=self)
+            InfoBar.warning(
+                "跳过已忽略",
+                f"已跳过 {skipped} 个忽略更新的仓库",
+                duration=4000,
+                parent=self,
+            )
 
         if not to_update:
             if skipped:
-                InfoBar.warning("提示", "选中的仓库均已忽略更新，无可执行项", parent=self)
+                InfoBar.warning(
+                    "提示", "选中的仓库均已忽略更新，无可执行项", parent=self
+                )
             return
 
-        for row, repo in to_update:
-            self.executor.submit(self.pull_repo, repo, row)
+        for repo in to_update:
+            self.executor.submit(self.pull_repo, repo)
         logger.info(f"[批量更新] 已提交 {len(to_update)} 个仓库")
-        InfoBar.success("已开始", f"正在更新 {len(to_update)} 个仓库" + (f"（跳过 {skipped} 个已忽略）" if skipped else ""), parent=self)
+        InfoBar.success(
+            "已开始",
+            f"正在更新 {len(to_update)} 个仓库"
+            + (f"（跳过 {skipped} 个已忽略）" if skipped else ""),
+            parent=self,
+        )
 
     def on_context_menu(self, pos):
         item = self.table.itemAt(pos)
@@ -1096,11 +917,17 @@ class GitManager(MSFluentWindow):
 
         menu = RoundMenu(parent=self)
 
-        menu.addAction(Action(FIF.FOLDER, "打开本地", triggered=lambda: self._open_local_folder(repo)))
+        menu.addAction(
+            Action(
+                FIF.FOLDER, "打开本地", triggered=lambda: self._open_local_folder(repo)
+            )
+        )
 
         cache = self._repo_cache.get(repo, {})
         remote_url = cache.get("remote_url", "")
-        open_remote = Action(FIF.GLOBE, "打开远端", triggered=lambda: self._open_remote_url(repo))
+        open_remote = Action(
+            FIF.GLOBE, "打开远端", triggered=lambda: self._open_remote_url(repo)
+        )
         if not remote_url:
             open_remote.setEnabled(False)
         menu.addAction(open_remote)
@@ -1109,27 +936,62 @@ class GitManager(MSFluentWindow):
 
         # 忽略更新 / 恢复更新（动态显示）
         if self.is_repo_ignored(repo):
-            menu.addAction(Action(FIF.PLAY, "继续更新", triggered=lambda: self._toggle_ignore_update(row, repo, ignore=False)))
+            menu.addAction(
+                Action(
+                    FIF.PLAY,
+                    "继续更新",
+                    triggered=lambda: self._toggle_ignore_update(repo, ignore=False),
+                )
+            )
         else:
-            menu.addAction(Action(FIF.PAUSE, "忽略更新", triggered=lambda: self._toggle_ignore_update(row, repo, ignore=True)))
+            menu.addAction(
+                Action(
+                    FIF.PAUSE,
+                    "忽略更新",
+                    triggered=lambda: self._toggle_ignore_update(repo, ignore=True),
+                )
+            )
 
         menu.addSeparator()
 
-        menu.addAction(Action(FIF.DELETE, "删除仓库", triggered=lambda: self._context_delete_repo(row, repo)))
+        menu.addAction(
+            Action(
+                FIF.EDIT,
+                "重命名仓库",
+                triggered=lambda: self._context_rename_repo(repo),
+            )
+        )
+        menu.addAction(
+            Action(
+                FIF.DELETE,
+                "删除仓库",
+                triggered=lambda: self._context_delete_repo(repo),
+            )
+        )
 
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
-    def _toggle_ignore_update(self, row: int, repo: str, ignore: bool):
-        """切换仓库的忽略更新状态。"""
-        repo_name = os.path.basename(repo.rstrip("\\/"))
+    def _toggle_ignore_update(self, repo_path: str, ignore: bool):
+        """切换仓库的忽略更新状态。使用repo_path而不是row"""
+        repo_name = os.path.basename(repo_path.rstrip("\\/"))
         if ignore:
-            self.ignore_repo_update(repo)
-            InfoBar.success("忽略更新", f"{repo_name} 仓库已忽略更新检查", duration=4000, parent=self)
+            self.ignore_repo_update(repo_path)
+            InfoBar.success(
+                "忽略更新",
+                f"{repo_name} 仓库已忽略更新检查",
+                duration=4000,
+                parent=self,
+            )
         else:
-            self.restore_repo_update(repo)
-            InfoBar.success("恢复更新", f"{repo_name} 仓库已恢复更新检查", duration=4000, parent=self)
-        # 立即刷新当前仓库状态
-        self.executor.submit(self.load_repo_info, row, repo, None)
+            self.restore_repo_update(repo_path)
+            InfoBar.success(
+                "恢复更新",
+                f"{repo_name} 仓库已恢复更新检查",
+                duration=4000,
+                parent=self,
+            )
+        # 立即刷新当前仓库状态（自动查找行号）
+        self.executor.submit(self.load_repo_info, repo_path, None)
 
     def _open_local_folder(self, repo: str):
         path = os.path.abspath(repo)
@@ -1151,69 +1013,207 @@ class GitManager(MSFluentWindow):
         webbrowser.open(remote_url)
         logger.info(f"打开远端地址: {remote_url}")
 
-    def _context_delete_repo(self, row: int, repo: str):
-        repo_name = os.path.basename(repo.rstrip("\\/"))
-        expected_target = os.path.abspath(os.path.join(os.path.abspath(self.base_dir), repo_name))
-        selected_target = os.path.abspath(repo)
+    def _context_delete_repo(self, repo_path: str):
+        """删除仓库。支持完全删除和仅删除Git两种模式"""
+        repo_path = os.path.abspath(repo_path)
+        repo_name = os.path.basename(repo_path.rstrip("\\/"))
+        expected_target = os.path.abspath(
+            os.path.join(os.path.abspath(self.base_dir), repo_name)
+        )
+        selected_target = repo_path
         if selected_target != expected_target:
             InfoBar.error("失败", "只允许删除当前基础目录下的直属仓库目录", parent=self)
             return
 
-        box = MessageBox("确认删除仓库", f"确定删除本地仓库？\n\n{repo}", self)
-        box.yesButton.setText("删除")
-        box.cancelButton.setText("取消")
-        if not box.exec():
+        # 显示删除对话框
+        dlg = DeleteRepoDialog(repo_path, parent=self)
+        if not dlg.exec():
             return
 
         try:
-            result = safe_remove_repo_dir(self.base_dir, repo_name, onerror=self._handle_remove_readonly)
-            if result["success"]:
-                logger.success(f"已删除仓库: {selected_target}")
-                self.table.removeRow(row)
-                try:
-                    self.repos.remove(repo)
-                except ValueError:
-                    pass
-                self._repo_cache.pop(repo, None)
-                self._remove_ignored_record(repo)
-                self._save_cached_config()
-                InfoBar.success("成功", "仓库已删除", parent=self)
+            if dlg.is_delete_all():
+                # 完全删除整个仓库目录
+                result = safe_remove_repo_dir(
+                    self.base_dir, repo_name, onerror=self._handle_remove_readonly
+                )
+                delete_type = "仓库"
             else:
-                logger.error(f"删除仓库失败: {result['error']}")
-                InfoBar.error("失败", (result["error"] or "删除失败")[:150], parent=self)
+                # 仅删除.git文件夹
+                result = safe_remove_git_only(
+                    repo_path, onerror=self._handle_remove_readonly
+                )
+                delete_type = ".git文件夹"
+
+            if result["success"]:
+                logger.success(f"已删除{delete_type}: {selected_target}")
+
+                # 仅当完全删除时才移除表格行和缓存
+                if dlg.is_delete_all():
+                    row = self.get_row_by_repo_path(repo_path)
+                    if row != -1:
+                        self.table.removeRow(row)
+                    try:
+                        self.repos.remove(repo_path)
+                    except ValueError:
+                        pass
+                    self._repo_cache.pop(repo_path, None)
+                    self._remove_ignored_record(repo_path)
+                    self._save_cached_config()
+
+                InfoBar.success("成功", f"{delete_type}已删除", parent=self)
+            else:
+                logger.error(f"删除{delete_type}失败: {result['error']}")
+                InfoBar.error(
+                    "失败", (result["error"] or "删除失败")[:150], parent=self
+                )
         except Exception as e:
             logger.error(f"删除仓库失败: {str(e)}")
             InfoBar.error("失败", str(e)[:150], parent=self)
 
+    def _context_rename_repo(self, repo_path: str):
+        """重命名仓库目录"""
+        repo_path = os.path.abspath(repo_path)
+        repo_name = os.path.basename(repo_path.rstrip("\\/"))
+        expected_target = os.path.abspath(
+            os.path.join(os.path.abspath(self.base_dir), repo_name)
+        )
+        selected_target = repo_path
+
+        if selected_target != expected_target:
+            InfoBar.error(
+                "失败", "只允许重命名当前基础目录下的直属仓库目录", parent=self
+            )
+            return
+
+        # 显示重命名对话框
+        dlg = RenameRepoDialog(repo_name, parent=self)
+        if not dlg.exec():
+            return
+
+        new_name = dlg.get_new_name()
+
+        # 验证新名称
+        if new_name == repo_name:
+            InfoBar.info("提示", "新名称与当前名称相同", parent=self)
+            return
+
+        # 检查新名称是否已存在
+        new_path = os.path.join(self.base_dir, new_name)
+        if os.path.exists(new_path):
+            InfoBar.error("失败", f"名称 '{new_name}' 已存在", parent=self)
+            return
+
+        try:
+            # 重命名目录
+            os.rename(repo_path, new_path)
+            logger.success(f"已重命名仓库: {repo_name} → {new_name}")
+
+            # 更新repos列表中的路径
+            try:
+                idx = self.repos.index(repo_path)
+                self.repos[idx] = new_path
+            except ValueError:
+                pass
+
+            # 更新缓存
+            if repo_path in self._repo_cache:
+                self._repo_cache[new_path] = self._repo_cache.pop(repo_path)
+
+            # 更新忽略记录
+            if self.is_repo_ignored(repo_path):
+                self._ignored_repos.discard(repo_path)
+                self._ignored_repos.add(new_path)
+
+            # 更新表格中的repo_path
+            row = self.get_row_by_repo_path(repo_path)
+            if row != -1:
+                repo_item = self.table.item(row, 1)
+                if repo_item:
+                    repo_item.setData(Qt.UserRole, new_path)
+
+            self._save_cached_config()
+            InfoBar.success("成功", f"已重命名为 '{new_name}'", parent=self)
+        except Exception as e:
+            logger.error(f"重命名仓库失败: {str(e)}")
+            InfoBar.error("失败", str(e)[:150], parent=self)
+
+    def verify_proxy_settings(self):
+        """验证代理设置和GitHub连接性"""
+        proxy = self.load_proxy()
+
+        # 显示验证开始
+        InfoBar.info("验证中...", "正在验证代理配置和连接性，请稍候...", parent=self)
+
+        # 创建工作线程
+        self._proxy_verify_worker = ProxyVerifyWorker(proxy, timeout=10)
+        self._proxy_verify_thread = QThread()
+        self._proxy_verify_worker.moveToThread(self._proxy_verify_thread)
+
+        # 连接信号
+        self._proxy_verify_worker.finished.connect(self._on_proxy_verify_finished)
+        self._proxy_verify_thread.started.connect(self._proxy_verify_worker.run)
+
+        # 启动线程
+        self._proxy_verify_thread.start()
+
+    def _on_proxy_verify_finished(self, success: bool, message: str):
+        """代理验证完成回调"""
+        # 清理线程
+        if self._proxy_verify_thread:
+            self._proxy_verify_thread.quit()
+            self._proxy_verify_thread.wait()
+            self._proxy_verify_thread = None
+
+        # 显示结果
+        if success:
+            InfoBar.success("验证成功", message, parent=self)
+            logger.success(f"代理验证通过: {message}")
+        else:
+            InfoBar.error("验证失败", message[:150], parent=self)
+            logger.error(f"代理验证失败: {message}")
+
     # ====================== 数据加载与按钮状态控制 ======================
-    def load_repo_info(self, row: int, repo: str, generation: int | None = None):
+    def load_repo_info(self, repo_path: str, generation: int | None = None):
+        """加载仓库信息。自动查找当前行号，不需要显式传递row"""
+        repo_path = os.path.abspath(repo_path)
+        row = self.get_row_by_repo_path(repo_path)
+        if row == -1:
+            logger.warning(f"未找到仓库行: {repo_path}")
+            return
+
         need_update = False
         ignored = False
         try:
-            local, _, _ = self.run_git(repo, ["rev-parse", "--short", "HEAD"])
-            branch, _, _ = self.run_git(repo, ["branch", "--show-current"])
+            local, _, _ = self.run_git(repo_path, ["rev-parse", "--short", "HEAD"])
+            branch, _, _ = self.run_git(repo_path, ["branch", "--show-current"])
             if not branch:
                 branch = "游离 HEAD"
 
             # 获取远端地址
-            remote_url, _, _ = self.run_git(repo, ["remote", "get-url", "origin"])
+            remote_url, _, _ = self.run_git(repo_path, ["remote", "get-url", "origin"])
 
             # 忽略更新的仓库：跳过 fetch 和远程检查
-            if self.is_repo_ignored(repo):
+            if self.is_repo_ignored(repo_path):
                 ignored = True
                 status = "⏸ 已忽略更新"
                 ahead_behind = "-"
                 remote_commit = "N/A"
             else:
-                self.run_git(repo, ["fetch", "--quiet"])
+                self.run_git(repo_path, ["fetch", "--quiet"])
 
-                ahead, _, _ = self.run_git(repo, ["rev-list", "--count", "HEAD", "^@{u}"])
-                behind, _, _ = self.run_git(repo, ["rev-list", "--count", "@{u}", "^HEAD"])
+                ahead, _, _ = self.run_git(
+                    repo_path, ["rev-list", "--count", "HEAD", "^@{u}"]
+                )
+                behind, _, _ = self.run_git(
+                    repo_path, ["rev-list", "--count", "@{u}", "^HEAD"]
+                )
 
                 ahead = int(ahead) if ahead.isdigit() else 0
                 behind = int(behind) if behind.isdigit() else 0
 
-                remote_commit, _, rc = self.run_git(repo, ["rev-parse", "--short", "@{u}"])
+                remote_commit, _, rc = self.run_git(
+                    repo_path, ["rev-parse", "--short", "@{u}"]
+                )
                 if rc != 0:
                     status = "错误"
                     ahead_behind = "N/A"
@@ -1225,22 +1225,43 @@ class GitManager(MSFluentWindow):
                     ahead_behind = f"↑{ahead} ↓{behind}"
                     need_update = True
 
-            self.update_row_signal.emit(row, repo, branch, local or "N/A", remote_commit or "N/A", status, ahead_behind, remote_url or "")
+            self.update_row_signal.emit(
+                row,
+                repo_path,
+                branch,
+                local or "N/A",
+                remote_commit or "N/A",
+                status,
+                ahead_behind,
+                remote_url or "",
+            )
         except Exception as e:
-            logger.error(f"加载失败 {repo}: {str(e)}")
-            self.update_row_signal.emit(row, repo, "N/A", "错误", "N/A", "错误", "N/A", "")
+            logger.error(f"加载失败 {repo_path}: {str(e)}")
+            self.update_row_signal.emit(
+                row, repo_path, "N/A", "错误", "N/A", "错误", "N/A", ""
+            )
         finally:
             if generation is not None:
                 self._mark_scan_progress(generation, need_update, ignored)
 
     def update_table_row(
-        self, row: int, repo: str, branch: str, local: str, remote_commit: str, status: str, ahead_behind: str, remote_url: str = ""
+        self,
+        row: int,
+        repo: str,
+        branch: str,
+        local: str,
+        remote_commit: str,
+        status: str,
+        ahead_behind: str,
+        remote_url: str = "",
     ):
         if row >= self.table.rowCount():
             return
 
         old_check_item = self.table.item(row, 0)
-        old_check_state = old_check_item.checkState() if old_check_item else Qt.Unchecked
+        old_check_state = (
+            old_check_item.checkState() if old_check_item else Qt.Unchecked
+        )
 
         check_item = QTableWidgetItem("")
         is_updatable = status == "可更新"
@@ -1260,7 +1281,11 @@ class GitManager(MSFluentWindow):
         repo_item.setToolTip(repo)
         self.table.setItem(row, 1, repo_item)
 
-        status_text = f"{status}  {ahead_behind}" if ahead_behind not in ("N/A", "✓", "-") else status
+        status_text = (
+            f"{status}  {ahead_behind}"
+            if ahead_behind not in ("N/A", "✓", "-")
+            else status
+        )
         for col, text in enumerate([branch, local, remote_commit, status_text]):
             item = QTableWidgetItem(text)
             item.setTextAlignment(Qt.AlignCenter)
@@ -1297,7 +1322,9 @@ class GitManager(MSFluentWindow):
         }
 
     # ====================== 更新逻辑 ======================
-    def pull_repo(self, repo: str, row: int):
+    def pull_repo(self, repo: str):
+        """拉取仓库更新。不需要row参数，通过repo_path查找行号"""
+        repo = os.path.abspath(repo)
         repo_name = os.path.basename(repo.rstrip("\\/"))
         logger.info(f"[更新] {repo}")
 
@@ -1308,25 +1335,33 @@ class GitManager(MSFluentWindow):
 
         if os.path.exists(os.path.join(repo, ".git", "MERGE_HEAD")):
             logger.warning("存在未完成 merge，跳过")
-            self.update_complete_signal.emit(repo_name, False, "存在未完成的 merge，请先处理后再更新。")
+            self.update_complete_signal.emit(
+                repo_name, False, "存在未完成的 merge，请先处理后再更新。"
+            )
             return
 
         clean, _, _ = self.run_git(repo, ["status", "--porcelain"])
         if clean.strip():
             logger.warning("工作区有未提交更改，跳过")
-            self.update_complete_signal.emit(repo_name, False, "工作区有未提交的更改，请先提交或暂存后再更新。")
+            self.update_complete_signal.emit(
+                repo_name, False, "工作区有未提交的更改，请先提交或暂存后再更新。"
+            )
             return
 
-        out, err, code = self.run_git(repo, ["-c", "core.editor=true", "pull", "--rebase"])
+        out, err, code = self.run_git(
+            repo, ["-c", "core.editor=true", "pull", "--rebase"]
+        )
 
-        self.load_repo_info(row, repo)
+        self.load_repo_info(repo, None)
 
         if code == 0:
             logger.success(f"{repo} 更新成功")
             self.update_complete_signal.emit(repo_name, True, "")
         else:
             logger.error(f"{repo} 更新失败\n{err}")
-            self.update_complete_signal.emit(repo_name, False, err[:200] if err else "更新过程中出现未知错误。")
+            self.update_complete_signal.emit(
+                repo_name, False, err[:200] if err else "更新过程中出现未知错误。"
+            )
 
     def on_item_clicked(self, item):
         row = item.row()
@@ -1351,8 +1386,7 @@ class GitManager(MSFluentWindow):
             InfoBar.error("失败", err[:150], parent=self)
 
         try:
-            row = self.repos.index(repo)
-            self.load_repo_info(row, repo)
+            self.load_repo_info(repo, None)
         except ValueError:
             pass
 
@@ -1376,7 +1410,9 @@ class GitManager(MSFluentWindow):
         logger.info(f"切换分支 {repo} → {branch_name}")
 
         if is_remote:
-            local_branch = branch_name.split("/", 1)[1] if "/" in branch_name else branch_name
+            local_branch = (
+                branch_name.split("/", 1)[1] if "/" in branch_name else branch_name
+            )
             local_match, _, _ = self.run_git(repo, ["branch", "--list", local_branch])
             if local_match.strip():
                 switch_args = ["switch", local_branch]
@@ -1395,8 +1431,7 @@ class GitManager(MSFluentWindow):
             InfoBar.error("失败", (err or "分支切换失败")[:150], parent=self)
 
         try:
-            row = self.repos.index(repo)
-            self.load_repo_info(row, repo)
+            self.load_repo_info(repo, None)
         except ValueError:
             pass
 

@@ -42,7 +42,13 @@ class GitRunner:
     # ------------------------------------------------------------------
     # 带进程跟踪的阻塞式执行
     # ------------------------------------------------------------------
-    def run_command(self, cmd: list[str], cwd: str | None = None, timeout=60, env: dict | None = None):
+    def run_command(
+        self,
+        cmd: list[str],
+        cwd: str | None = None,
+        timeout=60,
+        env: dict | None = None,
+    ):
         if self._is_closing:
             return "", "Application is closing", -1
 

@@ -56,9 +56,13 @@ class CloneManager:
 
         if parsed.scheme in ("http", "https") and parsed.netloc.lower() == "github.com":
             candidates.append(f"https://ghproxy.com/{primary}")
-        elif parsed.scheme in ("http", "https") and parsed.netloc.lower() == "gitee.com":
+        elif (
+            parsed.scheme in ("http", "https") and parsed.netloc.lower() == "gitee.com"
+        ):
             candidates.insert(0, primary)
-        elif parsed.scheme in ("http", "https") and parsed.netloc.lower() == "gitlab.com":
+        elif (
+            parsed.scheme in ("http", "https") and parsed.netloc.lower() == "gitlab.com"
+        ):
             candidates.append(primary)
 
         unique_candidates = []
