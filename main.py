@@ -1,11 +1,9 @@
 import os
-import stat
 import subprocess
 import sys
 import threading
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 
 from loguru import logger
 from PySide6.QtCore import QObject, Qt, QThread, Signal
@@ -46,124 +44,17 @@ from qfluentwidgets import (
 )
 
 from app.config import load_config, save_config, save_repo_cache
-from core.git_runner import GitRunner
-from models.repo import GitRepoCandidate
+from core.git_service import GitService
+from core.repo_service import RepoService
+from core.scan_service import ScanService
+from core.update_service import UpdateService
 from res_rc import qInitResources
 from ui.dialogs.branch_dialog import BranchDialog
 from ui.dialogs.clone_dialog import CloneRepoDialog
 from ui.dialogs.delete_dialog import DeleteRepoDialog
 from ui.dialogs.history_dialog import HistoryDialog
 from ui.dialogs.rename_dialog import RenameRepoDialog
-from utils.subprocess_utils import rmtree
 from workers.proxy_verify_worker import ProxyVerifyWorker
-
-
-def safe_remove_repo_dir(base_path: str, repo_name: str, onerror=None) -> dict:
-    result = {"success": False, "error": None}
-
-    if not repo_name or not repo_name.strip():
-        result["error"] = "repo_name 不能为空"
-        return result
-
-    if os.path.sep in repo_name or (os.path.altsep and os.path.altsep in repo_name):
-        result["error"] = "repo_name 不能包含路径分隔符"
-        return result
-
-    if repo_name in (".", "..") or ".." in repo_name:
-        result["error"] = "repo_name 包含非法路径片段"
-        return result
-
-    base_abs = os.path.abspath(base_path)
-    target_abs = os.path.abspath(os.path.join(base_abs, repo_name))
-
-    if not os.path.exists(base_abs):
-        result["error"] = "base_path 不存在"
-        return result
-
-    if not os.path.exists(target_abs):
-        result["error"] = "target_path 不存在"
-        return result
-
-    if base_abs == target_abs:
-        result["error"] = "禁止删除 base_path 本身"
-        return result
-
-    base_prefix = base_abs.rstrip("\\/") + os.sep
-    if not target_abs.startswith(base_prefix):
-        result["error"] = "target_path 不在 base_path 子目录中"
-        return result
-
-    try:
-        rmtree(target_abs, onerror=onerror)
-        result["success"] = True
-    except Exception as e:
-        result["error"] = str(e)
-    return result
-
-
-def safe_remove_git_only(repo_path: str, onerror=None) -> dict:
-    """删除仓库中的.git文件夹，保留其他文件"""
-    result = {"success": False, "error": None}
-
-    repo_abs = os.path.abspath(repo_path)
-    if not os.path.isdir(repo_abs):
-        result["error"] = "仓库路径不存在"
-        return result
-
-    git_dir = os.path.join(repo_abs, ".git")
-    if not os.path.exists(git_dir):
-        result["error"] = ".git 文件夹不存在"
-        return result
-
-    try:
-        rmtree(git_dir, onerror=onerror)
-        result["success"] = True
-    except Exception as e:
-        result["error"] = str(e)
-    return result
-
-
-def scan_git_repos(base_path: str) -> list[GitRepoCandidate]:
-    if not base_path or not base_path.strip():
-        return []
-
-    if ".." in Path(base_path).parts:
-        return []
-
-    base_abs = os.path.abspath(base_path)
-    if not os.path.isdir(base_abs):
-        return []
-
-    candidates: list[GitRepoCandidate] = []
-    base_prefix = base_abs.rstrip("\\/") + os.sep
-
-    try:
-        for entry_name in os.listdir(base_abs):
-            child_path = os.path.abspath(os.path.join(base_abs, entry_name))
-
-            if not child_path.startswith(base_prefix):
-                continue
-
-            if not os.path.isdir(child_path):
-                continue
-
-            git_path = os.path.abspath(os.path.join(child_path, ".git"))
-            if not git_path.startswith(child_path.rstrip("\\/") + os.sep):
-                continue
-
-            if os.path.exists(git_path) and os.path.isdir(git_path):
-                candidates.append(
-                    GitRepoCandidate(
-                        name=entry_name,
-                        path=child_path,
-                        is_git=True,
-                        git_path=git_path,
-                    )
-                )
-    except OSError:
-        return []
-
-    return candidates
 
 
 class QtLogHandler(QObject):
@@ -199,9 +90,9 @@ class GitManager(MSFluentWindow):
         super().__init__()
         qInitResources()
         setTheme(Theme.LIGHT)
-        GitRunner.run_simple(
-            ["git", "config", "--global", "core.quotepath", "false"], check=False
-        )
+        self.git_service = GitService()
+        self.update_service = UpdateService(self.git_service)
+        self.git_service.configure_global_quotepath()
 
         self.setWindowTitle("Git 多仓库管理器 - 高级版")
         self.setWindowIcon(QIcon(":/icon.ico"))
@@ -212,7 +103,6 @@ class GitManager(MSFluentWindow):
         self.repos: list[str] = []
         self._repo_cache: dict[str, dict] = {}  # path -> cached info
         self.executor = ThreadPoolExecutor(max_workers=6)
-        self._git_runner = GitRunner()
         self._scan_lock = threading.Lock()
         self._scan_generation = 0
         self._scan_expected = 0
@@ -239,9 +129,8 @@ class GitManager(MSFluentWindow):
         save_config(self._config_cache)
 
     def closeEvent(self, event):
-        self._git_runner.set_closing()
         self.executor.shutdown(wait=False, cancel_futures=True)
-        self._git_runner.terminate_active_processes()
+        self.git_service.shutdown()
         # 保存仓库缓存
         save_repo_cache(list(self._repo_cache.values()))
         logger.remove()
@@ -546,7 +435,7 @@ class GitManager(MSFluentWindow):
             InfoBar.warning(title, content, parent=self)
 
     def run_git(self, path: str, args: list, timeout=60):
-        return self._git_runner.run_git(path, args, timeout=timeout)
+        return self.git_service.run_git(path, args, timeout=timeout)
 
     def run_command(
         self,
@@ -555,7 +444,7 @@ class GitManager(MSFluentWindow):
         timeout=60,
         env: dict | None = None,
     ):
-        return self._git_runner.run_command(cmd, cwd=cwd, timeout=timeout, env=env)
+        return self.git_service.run_command(cmd, cwd=cwd, timeout=timeout, env=env)
 
     # ====================== 界面方法 ======================
     def select_folder(self):
@@ -571,13 +460,13 @@ class GitManager(MSFluentWindow):
             proxy = self.load_proxy()
         proxy = proxy.strip()
         if proxy:
-            GitRunner.run_simple(["git", "config", "--global", "http.proxy", proxy])
+            self.git_service.set_global_proxy(proxy)
             logger.success(f"代理已设置: {proxy}")
         else:
             self.clear_proxy()
 
     def clear_proxy(self):
-        GitRunner.run_simple(["git", "config", "--global", "--unset", "http.proxy"])
+        self.git_service.clear_global_proxy()
         logger.success("代理已清除")
 
     def select_settings_dir(self):
@@ -689,7 +578,7 @@ class GitManager(MSFluentWindow):
         self._repo_cache.clear()
         logger.info(f"开始扫描目录: {self.base_dir}")
 
-        repo_candidates = scan_git_repos(self.base_dir)
+        repo_candidates = ScanService.scan_git_repos(self.base_dir)
         with self._scan_lock:
             self._scan_generation += 1
             generation = self._scan_generation
@@ -793,16 +682,6 @@ class GitManager(MSFluentWindow):
             return
 
         self._context_delete_repo(repo)
-
-    @staticmethod
-    def _handle_remove_readonly(func, path, exc):
-        # exc 在 onexc 回调中是异常对象本身，在旧 onerror 中是 (type, value, tb) 元组
-        actual_exc = exc[1] if isinstance(exc, tuple) else exc
-        if isinstance(actual_exc, OSError):
-            os.chmod(path, stat.S_IWRITE)
-            func(path)
-            return
-        raise actual_exc
 
     def get_row_by_repo_path(self, repo_path: str) -> int:
         """根据repo_path查找当前表格中的行号。不存在返回-1"""
@@ -1017,11 +896,8 @@ class GitManager(MSFluentWindow):
         """删除仓库。支持完全删除和仅删除Git两种模式"""
         repo_path = os.path.abspath(repo_path)
         repo_name = os.path.basename(repo_path.rstrip("\\/"))
-        expected_target = os.path.abspath(
-            os.path.join(os.path.abspath(self.base_dir), repo_name)
-        )
         selected_target = repo_path
-        if selected_target != expected_target:
+        if not RepoService.is_direct_child(self.base_dir, repo_path):
             InfoBar.error("失败", "只允许删除当前基础目录下的直属仓库目录", parent=self)
             return
 
@@ -1033,14 +909,16 @@ class GitManager(MSFluentWindow):
         try:
             if dlg.is_delete_all():
                 # 完全删除整个仓库目录
-                result = safe_remove_repo_dir(
-                    self.base_dir, repo_name, onerror=self._handle_remove_readonly
+                result = RepoService.remove_repo_dir(
+                    self.base_dir,
+                    repo_name,
+                    onerror=RepoService.make_writable_and_retry,
                 )
                 delete_type = "仓库"
             else:
                 # 仅删除.git文件夹
-                result = safe_remove_git_only(
-                    repo_path, onerror=self._handle_remove_readonly
+                result = RepoService.remove_git_metadata(
+                    repo_path, onerror=RepoService.make_writable_and_retry
                 )
                 delete_type = ".git文件夹"
 
@@ -1074,12 +952,7 @@ class GitManager(MSFluentWindow):
         """重命名仓库目录"""
         repo_path = os.path.abspath(repo_path)
         repo_name = os.path.basename(repo_path.rstrip("\\/"))
-        expected_target = os.path.abspath(
-            os.path.join(os.path.abspath(self.base_dir), repo_name)
-        )
-        selected_target = repo_path
-
-        if selected_target != expected_target:
+        if not RepoService.is_direct_child(self.base_dir, repo_path):
             InfoBar.error(
                 "失败", "只允许重命名当前基础目录下的直属仓库目录", parent=self
             )
@@ -1097,15 +970,13 @@ class GitManager(MSFluentWindow):
             InfoBar.info("提示", "新名称与当前名称相同", parent=self)
             return
 
-        # 检查新名称是否已存在
-        new_path = os.path.join(self.base_dir, new_name)
-        if os.path.exists(new_path):
-            InfoBar.error("失败", f"名称 '{new_name}' 已存在", parent=self)
+        rename_result = RepoService.rename_repo(self.base_dir, repo_path, new_name)
+        if not rename_result["success"]:
+            InfoBar.error("失败", rename_result["error"][:150], parent=self)
             return
 
+        new_path = rename_result["path"]
         try:
-            # 重命名目录
-            os.rename(repo_path, new_path)
             logger.success(f"已重命名仓库: {repo_name} → {new_name}")
 
             # 更新repos列表中的路径
@@ -1184,56 +1055,21 @@ class GitManager(MSFluentWindow):
         need_update = False
         ignored = False
         try:
-            local, _, _ = self.run_git(repo_path, ["rev-parse", "--short", "HEAD"])
-            branch, _, _ = self.run_git(repo_path, ["branch", "--show-current"])
-            if not branch:
-                branch = "游离 HEAD"
-
-            # 获取远端地址
-            remote_url, _, _ = self.run_git(repo_path, ["remote", "get-url", "origin"])
-
-            # 忽略更新的仓库：跳过 fetch 和远程检查
-            if self.is_repo_ignored(repo_path):
-                ignored = True
-                status = "⏸ 已忽略更新"
-                ahead_behind = "-"
-                remote_commit = "N/A"
-            else:
-                self.run_git(repo_path, ["fetch", "--quiet"])
-
-                ahead, _, _ = self.run_git(
-                    repo_path, ["rev-list", "--count", "HEAD", "^@{u}"]
-                )
-                behind, _, _ = self.run_git(
-                    repo_path, ["rev-list", "--count", "@{u}", "^HEAD"]
-                )
-
-                ahead = int(ahead) if ahead.isdigit() else 0
-                behind = int(behind) if behind.isdigit() else 0
-
-                remote_commit, _, rc = self.run_git(
-                    repo_path, ["rev-parse", "--short", "@{u}"]
-                )
-                if rc != 0:
-                    status = "错误"
-                    ahead_behind = "N/A"
-                elif ahead == 0 and behind == 0:
-                    status = "✓ 已同步"
-                    ahead_behind = "✓"
-                else:
-                    status = "可更新"
-                    ahead_behind = f"↑{ahead} ↓{behind}"
-                    need_update = True
+            repo_status = self.git_service.inspect_repository(
+                repo_path, ignored=self.is_repo_ignored(repo_path)
+            )
+            need_update = repo_status.need_update
+            ignored = repo_status.ignored
 
             self.update_row_signal.emit(
                 row,
                 repo_path,
-                branch,
-                local or "N/A",
-                remote_commit or "N/A",
-                status,
-                ahead_behind,
-                remote_url or "",
+                repo_status.branch,
+                repo_status.local_commit,
+                repo_status.remote_commit,
+                repo_status.status,
+                repo_status.ahead_behind,
+                repo_status.remote_url,
             )
         except Exception as e:
             logger.error(f"加载失败 {repo_path}: {str(e)}")
@@ -1325,43 +1161,21 @@ class GitManager(MSFluentWindow):
     def pull_repo(self, repo: str):
         """拉取仓库更新。不需要row参数，通过repo_path查找行号"""
         repo = os.path.abspath(repo)
-        repo_name = os.path.basename(repo.rstrip("\\/"))
         logger.info(f"[更新] {repo}")
 
-        if self.is_repo_ignored(repo):
-            logger.info(f"[跳过更新] {repo_name} 已设置忽略更新")
-            self.update_complete_signal.emit(repo_name, False, "该仓库已设置忽略更新")
-            return
-
-        if os.path.exists(os.path.join(repo, ".git", "MERGE_HEAD")):
-            logger.warning("存在未完成 merge，跳过")
-            self.update_complete_signal.emit(
-                repo_name, False, "存在未完成的 merge，请先处理后再更新。"
-            )
-            return
-
-        clean, _, _ = self.run_git(repo, ["status", "--porcelain"])
-        if clean.strip():
-            logger.warning("工作区有未提交更改，跳过")
-            self.update_complete_signal.emit(
-                repo_name, False, "工作区有未提交的更改，请先提交或暂存后再更新。"
-            )
-            return
-
-        out, err, code = self.run_git(
-            repo, ["-c", "core.editor=true", "pull", "--rebase"]
+        result = self.update_service.update_repo(
+            repo, ignored=self.is_repo_ignored(repo)
         )
 
-        self.load_repo_info(repo, None)
+        if result.attempted:
+            self.load_repo_info(repo, None)
 
-        if code == 0:
+        if result.success:
             logger.success(f"{repo} 更新成功")
-            self.update_complete_signal.emit(repo_name, True, "")
+            self.update_complete_signal.emit(result.repo_name, True, "")
         else:
-            logger.error(f"{repo} 更新失败\n{err}")
-            self.update_complete_signal.emit(
-                repo_name, False, err[:200] if err else "更新过程中出现未知错误。"
-            )
+            logger.error(f"{repo} 更新失败\n{result.message}")
+            self.update_complete_signal.emit(result.repo_name, False, result.message)
 
     def on_item_clicked(self, item):
         row = item.row()
@@ -1376,14 +1190,14 @@ class GitManager(MSFluentWindow):
 
     def switch_to_commit(self, repo: str, commit: str, dialog=None):
         logger.warning(f"硬重置 {repo} → {commit}")
-        _, err, code = self.run_git(repo, ["reset", "--hard", commit])
+        result = self.git_service.reset_to_commit(repo, commit)
 
-        if code == 0:
+        if result.success:
             logger.success("重置成功")
             InfoBar.success("成功", f"已切换到 {commit[:12]}", parent=self)
         else:
-            logger.error(f"重置失败: {err}")
-            InfoBar.error("失败", err[:150], parent=self)
+            logger.error(f"重置失败: {result.error}")
+            InfoBar.error("失败", result.error[:150], parent=self)
 
         try:
             self.load_repo_info(repo, None)
@@ -1400,8 +1214,10 @@ class GitManager(MSFluentWindow):
             InfoBar.warning("提示", "分支名称为空", parent=self)
             return
 
-        current_branch, _, _ = self.run_git(repo, ["branch", "--show-current"])
-        if current_branch == branch_name:
+        result = self.git_service.switch_branch(
+            repo, branch_name, is_remote=is_remote
+        )
+        if result.already_active:
             InfoBar.warning("提示", "当前已经在该分支", parent=self)
             if dialog:
                 dialog.close()
@@ -1409,33 +1225,21 @@ class GitManager(MSFluentWindow):
 
         logger.info(f"切换分支 {repo} → {branch_name}")
 
-        if is_remote:
-            local_branch = (
-                branch_name.split("/", 1)[1] if "/" in branch_name else branch_name
-            )
-            local_match, _, _ = self.run_git(repo, ["branch", "--list", local_branch])
-            if local_match.strip():
-                switch_args = ["switch", local_branch]
-            else:
-                switch_args = ["switch", "--track", branch_name]
-        else:
-            switch_args = ["switch", branch_name]
-
-        _, err, code = self.run_git(repo, switch_args)
-
-        if code == 0:
+        if result.success:
             logger.success(f"分支切换成功: {branch_name}")
             InfoBar.success("成功", f"已切换到 {branch_name}", parent=self)
         else:
-            logger.error(f"分支切换失败: {err}")
-            InfoBar.error("失败", (err or "分支切换失败")[:150], parent=self)
+            logger.error(f"分支切换失败: {result.error}")
+            InfoBar.error(
+                "失败", (result.error or "分支切换失败")[:150], parent=self
+            )
 
         try:
             self.load_repo_info(repo, None)
         except ValueError:
             pass
 
-        if dialog and code == 0:
+        if dialog and result.success:
             dialog.close()
 
 
