@@ -17,31 +17,28 @@ from __future__ import annotations
 import os
 
 from PySide6.QtCore import QThread
-from PySide6.QtGui import QIcon, QTextCursor
-from PySide6.QtWidgets import QApplication, QDialog, QHBoxLayout, QVBoxLayout
+from PySide6.QtGui import QTextCursor
+from PySide6.QtWidgets import QApplication, QHBoxLayout
 from qfluentwidgets import FluentIcon as FIF
 from qfluentwidgets import (
     HorizontalSeparator,
     IndeterminateProgressBar,
     InfoBar,
     LineEdit,
-    MessageBox,
-    PrimaryPushButton,
-    PushButton,
+    MessageBoxBase,
     StrongBodyLabel,
     SubtitleLabel,
     TextEdit,
     ToolButton,
-    ToolTipFilter,
-    ToolTipPosition,
 )
 
 from core.clone_manager import CloneManager
+from ui.widgets.dark_window import ConfirmDialog, MaskFadeGuardMixin, apply_tooltip
 from workers.clone_worker import CloneWorker
 
 
-class CloneRepoDialog(QDialog):
-    """克隆仓库对话框 —— 支持实时输出、连续克隆、线程安全。"""
+class CloneRepoDialog(MaskFadeGuardMixin, MessageBoxBase):
+    """克隆仓库对话框（Fluent 风格遮罩弹窗）—— 支持实时输出、连续克隆、线程安全。"""
 
     def __init__(self, manager, parent=None):
         super().__init__(parent)
@@ -50,16 +47,11 @@ class CloneRepoDialog(QDialog):
         self._thread: QThread | None = None
         self._clone_running = False
 
-        self.setWindowTitle("克隆仓库")
-        self.setWindowIcon(QIcon(":/icon.ico"))
-        self.resize(680, 560)
+        # 弹窗宽度与日志区高度（遮罩弹窗大小由内容决定）
+        self.widget.setFixedWidth(680)
 
-        # ---- 主布局 ----
-        layout = QVBoxLayout(self)
-        layout.setSpacing(12)
-        layout.setContentsMargins(20, 20, 20, 20)
-
-        layout.addWidget(SubtitleLabel("克隆仓库"))
+        # ---- 标题 ----
+        self.viewLayout.addWidget(SubtitleLabel("克隆仓库"))
 
         # ---- URL 输入行 ----
         url_row = QHBoxLayout()
@@ -72,73 +64,70 @@ class CloneRepoDialog(QDialog):
         url_row.addWidget(self.urlLineEdit, 1)
 
         self.paste_btn = ToolButton(FIF.PASTE)
-        self.paste_btn.installEventFilter(
-            ToolTipFilter(self.paste_btn, 0, ToolTipPosition.BOTTOM)
-        )
-        self.paste_btn.setToolTip("从剪贴板粘贴")
+        apply_tooltip(self.paste_btn, "从剪贴板粘贴")
         self.paste_btn.clicked.connect(self._paste_from_clipboard)
         url_row.addWidget(self.paste_btn)
 
         self.format_btn = ToolButton(FIF.CODE)
-        self.format_btn.installEventFilter(
-            ToolTipFilter(self.format_btn, 0, ToolTipPosition.BOTTOM)
-        )
-        self.format_btn.setToolTip("自动格式化链接（例如 git clone 命令 → 纯 URL）")
+        apply_tooltip(self.format_btn, "自动格式化链接（例如 git clone 命令 → 纯 URL）")
         self.format_btn.clicked.connect(self._format_url)
         url_row.addWidget(self.format_btn)
 
-        layout.addLayout(url_row)
+        self.viewLayout.addLayout(url_row)
 
         # ---- 仓库信息区域 ----
         self._repo_name_label = StrongBodyLabel("仓库名称: -")
-        layout.addWidget(self._repo_name_label)
+        self.viewLayout.addWidget(self._repo_name_label)
 
         self._clone_dir_label = StrongBodyLabel("克隆目录: -")
-        layout.addWidget(self._clone_dir_label)
+        self.viewLayout.addWidget(self._clone_dir_label)
 
-        layout.addWidget(HorizontalSeparator())
+        self.viewLayout.addWidget(HorizontalSeparator())
 
         # ---- 进度区域 ----
-        self._status_label = SubtitleLabel("状态: 就绪")
-        layout.addWidget(self._status_label)
+        self._status_label = StrongBodyLabel("状态: 就绪")
+        self.viewLayout.addWidget(self._status_label)
 
         self._progress_bar = IndeterminateProgressBar()
         self._progress_bar.setVisible(False)
-        layout.addWidget(self._progress_bar)
+        self.viewLayout.addWidget(self._progress_bar)
 
         # ---- 实时日志窗口 ----
         log_header = QHBoxLayout()
         log_header.setSpacing(8)
-        log_header.addWidget(StrongBodyLabel("实时日志"))
+        log_header.addWidget(StrongBodyLabel("克隆日志"))
         log_header.addStretch()
         self._clear_log_btn = ToolButton(FIF.DELETE)
-        self._clear_log_btn.installEventFilter(
-            ToolTipFilter(self._clear_log_btn, 0, ToolTipPosition.BOTTOM)
-        )
-        self._clear_log_btn.setToolTip("清空日志")
+        apply_tooltip(self._clear_log_btn, "清空日志")
         self._clear_log_btn.clicked.connect(self._clear_log)
         log_header.addWidget(self._clear_log_btn)
-        layout.addLayout(log_header)
+        self.viewLayout.addLayout(log_header)
 
         self._log_edit = TextEdit()
         self._log_edit.setReadOnly(True)
         self._log_edit.setPlaceholderText("克隆开始后，Git 输出将显示在此处...")
-        layout.addWidget(self._log_edit, 1)
+        self._log_edit.setFixedHeight(240)
+        self.viewLayout.addWidget(self._log_edit)
 
-        # ---- 按钮区域 ----
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
+        # ---- 底部按钮（复用 MessageBoxBase 自带的 yes/cancel）----
+        # 断开默认的 accept/reject 连接：克隆窗口支持连续克隆，
+        # 点「克隆」不关闭弹窗；点「关闭」走取消检查逻辑
+        self.yesButton.setText("克隆")
+        self.yesButton.setEnabled(False)
+        apply_tooltip(self.yesButton, "开始克隆当前链接（不关闭窗口）")
+        try:
+            self.yesButton.clicked.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        self.yesButton.clicked.connect(self._on_start_clone)
 
-        self._start_btn = PrimaryPushButton(FIF.DOWNLOAD, "克隆")
-        self._start_btn.setEnabled(False)
-        self._start_btn.clicked.connect(self._on_start_clone)
-        btn_row.addWidget(self._start_btn)
-
-        self._close_btn = PushButton(FIF.CLOSE, "关闭")
-        self._close_btn.clicked.connect(self._on_close_clicked)
-        btn_row.addWidget(self._close_btn)
-
-        layout.addLayout(btn_row)
+        self.cancelButton.setText("关闭")
+        apply_tooltip(self.cancelButton, "关闭克隆窗口（克隆中点击将确认中止）")
+        try:
+            self.cancelButton.clicked.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        self.cancelButton.clicked.connect(self._on_close_clicked)
 
     # ------------------------------------------------------------------
     # 剪贴板粘贴
@@ -181,10 +170,10 @@ class CloneRepoDialog(QDialog):
     # ------------------------------------------------------------------
     def _validate_url(self):
         if self._clone_running:
-            self._start_btn.setEnabled(False)
+            self.yesButton.setEnabled(False)
             return
         url = self.urlLineEdit.text().strip()
-        self._start_btn.setEnabled(bool(url))
+        self.yesButton.setEnabled(bool(url))
 
     def repo_url(self) -> str:
         return self.urlLineEdit.text().strip()
@@ -220,11 +209,11 @@ class CloneRepoDialog(QDialog):
         self._repo_name_label.setText(f"仓库名称: {repo_name}")
         self._clone_dir_label.setText(f"克隆目录: {target_path}")
         self._log_edit.clear()
-        self._start_btn.setEnabled(False)
+        self.yesButton.setEnabled(False)
         self.urlLineEdit.setEnabled(False)
         self.paste_btn.setEnabled(False)
         self.format_btn.setEnabled(False)
-        self._close_btn.setText("取消克隆")
+        self.cancelButton.setText("取消")
 
         # 创建 Worker 并移入 QThread
         self._worker = CloneWorker(normalized_url, self._manager.base_dir, repo_name)
@@ -266,11 +255,11 @@ class CloneRepoDialog(QDialog):
         self._worker = None
 
         # 恢复 UI
-        self._start_btn.setEnabled(True)
+        self.yesButton.setEnabled(True)
         self.urlLineEdit.setEnabled(True)
         self.paste_btn.setEnabled(True)
         self.format_btn.setEnabled(True)
-        self._close_btn.setText("关闭")
+        self.cancelButton.setText("关闭")
 
         if success:
             self._status_label.setText("状态: 克隆完成")
@@ -298,17 +287,17 @@ class CloneRepoDialog(QDialog):
     # ------------------------------------------------------------------
     def _on_close_clicked(self):
         if self._clone_running:
-            box = MessageBox(
+            box = ConfirmDialog(
                 "确认关闭",
                 "克隆正在进行中，关闭窗口将中止克隆。\n确定要关闭吗？",
                 self,
             )
-            box.yesButton.setText("关闭并中止")
+            box.yesButton.setText("确认")
             box.cancelButton.setText("取消")
             if not box.exec():
                 return
             self._stop_clone()
-        self.close()
+        self.reject()
 
     def _stop_clone(self):
         self._clone_running = False
@@ -327,11 +316,11 @@ class CloneRepoDialog(QDialog):
             self._thread = None
         # 恢复 UI
         self._set_cloning_ui(False)
-        self._start_btn.setEnabled(True)
+        self.yesButton.setEnabled(True)
         self.urlLineEdit.setEnabled(True)
         self.paste_btn.setEnabled(True)
         self.format_btn.setEnabled(True)
-        self._close_btn.setText("关闭")
+        self.cancelButton.setText("关闭")
         self._status_label.setText("状态: 已取消")
 
     def closeEvent(self, event):

@@ -27,7 +27,9 @@ class ScanService:
         try:
             for entry_name in os.listdir(base_abs):
                 child_path = os.path.abspath(os.path.join(base_abs, entry_name))
-                if not child_path.startswith(base_prefix) or not os.path.isdir(child_path):
+                if not child_path.startswith(base_prefix) or not os.path.isdir(
+                    child_path
+                ):
                     continue
 
                 git_path = os.path.abspath(os.path.join(child_path, ".git"))

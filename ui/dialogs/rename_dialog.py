@@ -1,99 +1,153 @@
 """重命名仓库对话框"""
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QDialog, QHBoxLayout, QLineEdit, QVBoxLayout
-from qfluentwidgets import BodyLabel, PrimaryPushButton, PushButton, StrongBodyLabel
+import re
+
+from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout
+from qfluentwidgets import BodyLabel
+from qfluentwidgets import FluentIcon as FIF
+from qfluentwidgets import InfoBar, LineEdit, PushButton
+
+from ui.widgets.dark_window import DarkDialog, apply_tooltip
 
 
-class RenameRepoDialog(QDialog):
+class RenameRepoDialog(DarkDialog):
     """重命名仓库对话框"""
 
     def __init__(self, current_name: str, parent=None):
         super().__init__(parent)
+
         self.current_name = current_name
         self.new_name = None
+
         self._init_ui()
+        self._connect_signal()
 
     def _init_ui(self):
         """初始化界面"""
+
         self.setWindowTitle("重命名仓库")
-        self.setWindowModality(Qt.WindowModal)
 
-        # 创建主布局
-        layout = QVBoxLayout()
+        self.resize(420, 220)
+        self.setMinimumWidth(380)
 
-        # 标题
-        title = StrongBodyLabel("重命名仓库")
-        layout.addWidget(title)
+        main_layout = QVBoxLayout(self)
+        main_layout.setSpacing(12)
+        # 顶部下移避开标题栏
+        main_layout.setContentsMargins(16, 44, 16, 16)
 
         # 当前名称
-        current_label = BodyLabel(f"当前名称: {self.current_name}")
-        layout.addWidget(current_label)
+        current_label = BodyLabel(f"仓库名称：{self.current_name}")
 
-        layout.addSpacing(10)
+        main_layout.addWidget(current_label)
 
         # 输入框
-        new_name_label = BodyLabel("新名称:")
-        layout.addWidget(new_name_label)
 
-        self.name_input = QLineEdit()
+        name_label = BodyLabel("新名称:")
+
+        main_layout.addWidget(name_label)
+
+        self.name_input = LineEdit()
+
         self.name_input.setText(self.current_name)
         self.name_input.selectAll()
-        self.name_input.setMinimumHeight(35)
-        layout.addWidget(self.name_input)
+        self.name_input.setClearButtonEnabled(True)
 
-        layout.addSpacing(10)
+        main_layout.addWidget(self.name_input)
 
         # 提示
-        tip_label = BodyLabel("ℹ️ 仓库目录将被重命名（本地操作）")
-        tip_label.setStyleSheet("color: #666666;")
-        layout.addWidget(tip_label)
 
-        layout.addStretch()
+        tip = BodyLabel("提示：只会修改本地仓库目录名称，不影响 Git 远程地址")
+
+        tip.setStyleSheet("color:#777;")
+
+        main_layout.addWidget(tip)
+
+        main_layout.addStretch()
 
         # 按钮
+
         button_layout = QHBoxLayout()
+
         button_layout.addStretch()
 
-        cancel_btn = PushButton("取消")
-        cancel_btn.clicked.connect(self.reject)
-        button_layout.addWidget(cancel_btn)
+        self.cancel_btn = PushButton(FIF.CANCEL, "取消")
+        apply_tooltip(self.cancel_btn, "取消重命名并关闭窗口")
 
-        confirm_btn = PrimaryPushButton("确认重命名")
-        confirm_btn.clicked.connect(self._on_confirm)
-        button_layout.addWidget(confirm_btn)
+        self.confirm_btn = PushButton(FIF.SAVE, "确认")
+        apply_tooltip(self.confirm_btn, "确认重命名项目文件夹")
 
-        layout.addLayout(button_layout)
+        button_layout.addWidget(self.cancel_btn)
 
-        self.setLayout(layout)
-        self.setMinimumWidth(350)
+        button_layout.addWidget(self.confirm_btn)
+
+        main_layout.addLayout(button_layout)
+
+    def _connect_signal(self):
+        """绑定事件"""
+
+        self.cancel_btn.clicked.connect(self.reject)
+
+        self.confirm_btn.clicked.connect(self._on_confirm)
+
+        self.name_input.returnPressed.connect(self._on_confirm)
+
+    def showEvent(self, event):
+        """显示后自动聚焦"""
+
+        super().showEvent(event)
+
+        self.name_input.setFocus()
+
+    def _validate_name(self, name: str):
+        """
+        验证目录名称
+
+        Returns:
+            bool
+        """
+
+        if not name:
+            InfoBar.warning("名称错误", "新名称不能为空", parent=self)
+
+            return False
+
+        if name == self.current_name:
+
+            InfoBar.info("提示", "新名称没有变化", parent=self)
+
+            return False
+
+        # Windows 文件名非法字符
+
+        if re.search(r'[<>:"/\\|?*\x00-\x1f]', name):
+
+            InfoBar.warning("名称错误", "名称包含 Windows 不允许的字符", parent=self)
+
+            return False
+
+        # 点结尾
+
+        if name.endswith("."):
+
+            InfoBar.warning("名称错误", "名称不能以点结尾", parent=self)
+
+            return False
+
+        return True
 
     def _on_confirm(self):
-        """确认重命名"""
+        """确认"""
+
         new_name = self.name_input.text().strip()
 
-        # 验证新名称
-        if not new_name:
-            from qfluentwidgets import InfoBar
-
-            InfoBar.warning("提示", "新名称不能为空", parent=self)
-            return
-
-        if new_name == self.current_name:
-            from qfluentwidgets import InfoBar
-
-            InfoBar.info("提示", "新名称与当前名称相同", parent=self)
-            return
-
-        if "/" in new_name or "\\" in new_name or ":" in new_name:
-            from qfluentwidgets import InfoBar
-
-            InfoBar.warning("提示", "新名称不能包含非法字符", parent=self)
+        if not self._validate_name(new_name):
             return
 
         self.new_name = new_name
+
         self.accept()
 
     def get_new_name(self) -> str:
         """获取新名称"""
+
         return self.new_name or self.current_name

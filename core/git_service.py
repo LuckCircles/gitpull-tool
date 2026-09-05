@@ -7,6 +7,8 @@ lifecycle or invoke global Git configuration commands directly.
 from __future__ import annotations
 
 import os
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 from core.git_runner import GitRunner
@@ -37,6 +39,29 @@ class GitService:
 
     def __init__(self, runner: GitRunner | None = None):
         self._runner = runner or GitRunner()
+        # per-repo 互斥锁：同一仓库的 git 写操作（fetch/pull）串行化，
+        # 避免扫描与更新并发执行时产生 .git/index.lock 冲突
+        self._repo_locks: dict[str, threading.Lock] = {}
+        self._repo_locks_guard = threading.Lock()
+
+    def _get_repo_lock(self, repo_path: str) -> threading.Lock:
+        key = os.path.abspath(repo_path).lower()  # Windows 路径大小写不敏感
+        with self._repo_locks_guard:
+            return self._repo_locks.setdefault(key, threading.Lock())
+
+    @contextmanager
+    def repo_lock(self, repo_path: str):
+        """以互斥方式对同一仓库执行 git 写操作。
+
+        用法::
+
+            with self._git_service.repo_lock(repo):
+                self._git_service.run_git(repo, ["pull", "--rebase"])
+
+        注意：锁不可重入，持锁期间不要再获取同一仓库的锁。
+        """
+        with self._get_repo_lock(repo_path):
+            yield
 
     def configure_global_quotepath(self):
         return GitRunner.run_simple(
@@ -65,7 +90,9 @@ class GitService:
     ):
         return self._runner.run_command(command, cwd=cwd, timeout=timeout, env=env)
 
-    def inspect_repository(self, repo_path: str, *, ignored: bool = False) -> RepoStatus:
+    def inspect_repository(
+        self, repo_path: str, *, ignored: bool = False
+    ) -> RepoStatus:
         """Read the status displayed for a repository during a scan."""
         repo_abs = os.path.abspath(repo_path)
         local_commit, _, _ = self.run_git(repo_abs, ["rev-parse", "--short", "HEAD"])
@@ -87,13 +114,11 @@ class GitService:
                 True,
             )
 
-        self.run_git(repo_abs, ["fetch", "--quiet"])
-        ahead, _, _ = self.run_git(
-            repo_abs, ["rev-list", "--count", "HEAD", "^@{u}"]
-        )
-        behind, _, _ = self.run_git(
-            repo_abs, ["rev-list", "--count", "@{u}", "^HEAD"]
-        )
+        # fetch 持仓库锁，与更新(pull)串行化，避免并发写 .git 产生 lock 冲突
+        with self.repo_lock(repo_abs):
+            self.run_git(repo_abs, ["fetch", "--quiet"])
+        ahead, _, _ = self.run_git(repo_abs, ["rev-list", "--count", "HEAD", "^@{u}"])
+        behind, _, _ = self.run_git(repo_abs, ["rev-list", "--count", "@{u}", "^HEAD"])
         remote_commit, _, return_code = self.run_git(
             repo_abs, ["rev-parse", "--short", "@{u}"]
         )

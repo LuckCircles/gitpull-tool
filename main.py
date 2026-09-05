@@ -1,3 +1,5 @@
+import contextlib
+import io
 import os
 import subprocess
 import sys
@@ -18,12 +20,15 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+# 提前加载 qfluentwidgets 配置模块，屏蔽其推广信息（print 到 stdout）
+with contextlib.redirect_stdout(io.StringIO()):
+    import qfluentwidgets.common.config  # noqa: F401
+
 from qfluentwidgets import Action
 from qfluentwidgets import FluentIcon as FIF
 from qfluentwidgets import (
     HorizontalSeparator,
     InfoBar,
-    MessageBoxBase,
     MSFluentWindow,
     NavigationItemPosition,
     PrimaryPushButton,
@@ -38,7 +43,6 @@ from qfluentwidgets import (
     TextEdit,
     Theme,
     ToolButton,
-    ToolTipFilter,
     ToolTipPosition,
     setTheme,
 )
@@ -52,8 +56,9 @@ from res_rc import qInitResources
 from ui.dialogs.branch_dialog import BranchDialog
 from ui.dialogs.clone_dialog import CloneRepoDialog
 from ui.dialogs.delete_dialog import DeleteRepoDialog
-from ui.dialogs.history_dialog import HistoryDialog
+from ui.widgets.history_page import HistoryWindow
 from ui.dialogs.rename_dialog import RenameRepoDialog
+from ui.widgets.dark_window import InputDialog, apply_tooltip
 from workers.proxy_verify_worker import ProxyVerifyWorker
 
 
@@ -77,9 +82,10 @@ class QtLogHandler(QObject):
 
 # ====================== 主窗口 ======================
 class GitManager(MSFluentWindow):
-    update_row_signal = Signal(
-        int, str, str, str, str, str, str, str
-    )  # row, repo, branch, local, remote_commit, status, ahead_behind, remote_url
+    # repo, branch, local, remote_commit, status, ahead_behind, remote_url
+    # 行号由 update_table_row 在主线程内根据 repo_path 查找，
+    # 保证 load_repo_info 可安全在工作线程调用（不触碰任何控件）
+    update_row_signal = Signal(str, str, str, str, str, str, str)
     notify_signal = Signal(str, str, str)
     scan_summary_signal = Signal(
         int, int, int
@@ -89,7 +95,7 @@ class GitManager(MSFluentWindow):
     def __init__(self):
         super().__init__()
         qInitResources()
-        setTheme(Theme.LIGHT)
+        setTheme(Theme.DARK)
         self.git_service = GitService()
         self.update_service = UpdateService(self.git_service)
         self.git_service.configure_global_quotepath()
@@ -110,6 +116,7 @@ class GitManager(MSFluentWindow):
         self._scan_need_update = 0
         self._scan_ignored = 0
         self._proxy_verify_thread = None  # 代理验证线程
+        self._history_window: HistoryWindow | None = None  # 版本历史独立窗口
 
         self.init_ui()
         self.apply_proxy(self.load_proxy())
@@ -221,6 +228,8 @@ class GitManager(MSFluentWindow):
         self._save_cached_config()
 
     def init_ui(self):
+        # MSFluentWindow：导航栏/标题栏/堆叠窗口均由基类内置
+        # （self.navigationInterface / self.stackedWidget / self.titleBar）
         self.repo_page = QWidget()
         self.repo_page.setObjectName("repo_page")
         repo_layout = QVBoxLayout(self.repo_page)
@@ -240,17 +249,25 @@ class GitManager(MSFluentWindow):
         top.addWidget(self.search_edit)
 
         self.scan_btn = PushButton(FIF.SYNC, "扫描仓库")
+        apply_tooltip(self.scan_btn, "扫描基础目录下的所有 Git 仓库")
         self.scan_btn.clicked.connect(self.scan_repos)
         self.add_repo_btn = PushButton(FIF.ADD, "添加仓库")
+        apply_tooltip(self.add_repo_btn, "通过克隆 URL 添加新仓库")
         self.add_repo_btn.clicked.connect(self.show_clone_dialog)
         self.remove_repo_btn = PushButton(FIF.DELETE, "删除仓库")
+        apply_tooltip(self.remove_repo_btn, "删除当前选中的仓库")
         self.remove_repo_btn.clicked.connect(self.delete_selected_repo)
+        self.update_selected_btn = PushButton(FIF.UPDATE, "更新所选")
+        apply_tooltip(self.update_selected_btn, "更新所有勾选的仓库")
+        self.update_selected_btn.clicked.connect(self.update_checked_repos)
         self.bulk_update_btn = PrimaryPushButton(FIF.UPDATE, "一键更新")
-        self.bulk_update_btn.clicked.connect(self.update_checked_repos)
+        apply_tooltip(self.bulk_update_btn, "更新列表中的全部仓库")
+        self.bulk_update_btn.clicked.connect(self.update_all_repos)
 
         top.addWidget(self.scan_btn)
         top.addWidget(self.add_repo_btn)
         top.addWidget(self.remove_repo_btn)
+        top.addWidget(self.update_selected_btn)
         top.addWidget(self.bulk_update_btn)
         repo_layout.addLayout(top)
 
@@ -389,10 +406,12 @@ class GitManager(MSFluentWindow):
 
         self.save_btn = PrimaryPushButton(FIF.SAVE, "保存设置")
         self.save_btn.setMinimumWidth(160)
+        apply_tooltip(self.save_btn, "保存设置页的配置")
         self.save_btn.clicked.connect(self.apply_settings_from_page)
 
         self.reset_btn = PushButton(FIF.CANCEL, "重置")
         self.reset_btn.setMinimumWidth(100)
+        apply_tooltip(self.reset_btn, "恢复为上次保存的配置")
         self.reset_btn.clicked.connect(self._reset_settings)
 
         bottom_layout.addStretch()
@@ -402,14 +421,7 @@ class GitManager(MSFluentWindow):
 
         settings_layout.addStretch(1)
 
-        self.addSubInterface(self.repo_page, FIF.HOME, "仓库")
-        self.addSubInterface(self.log_page, FIF.DOCUMENT, "日志")
-        self.addSubInterface(
-            self.settings_page,
-            FIF.SETTING,
-            "设置",
-            position=NavigationItemPosition.BOTTOM,
-        )
+        self.init_layout()
 
         self.update_row_signal.connect(self.update_table_row)
         self.notify_signal.connect(self.show_notification)
@@ -421,6 +433,18 @@ class GitManager(MSFluentWindow):
     def _load_repo_cache_startup(self):
         """启动时不加载、不扫描、不刷新仓库列表。"""
         return
+
+    def init_layout(self):
+        """注册子页面（布局/标题栏/路由同步由 MSFluentWindow 内置处理）。"""
+        self.addSubInterface(self.repo_page, FIF.HOME, "仓库")
+        self.addSubInterface(self.log_page, FIF.DOCUMENT, "日志")
+        # 注意：第 4 个位置参数是 selectedIcon，position 必须用关键字传递
+        self.addSubInterface(
+            self.settings_page,
+            FIF.SETTING,
+            "设置",
+            position=NavigationItemPosition.BOTTOM,
+        )
 
     # ====================== 工具方法 ======================
     def log_print(self, msg: str):
@@ -497,39 +521,29 @@ class GitManager(MSFluentWindow):
         InfoBar.success("成功", "设置已保存并应用", parent=self)
 
     def _edit_proxy(self):
-        dialog = MessageBoxBase(self)
-        dialog.titleLabel = SubtitleLabel("编辑代理地址")
-        dialog.cancelButton.setText("取消")
+        dialog = InputDialog(
+            "编辑代理地址",
+            placeholder="例如: http://127.0.0.1:7897",
+            default=self.load_proxy(),
+            parent=self,
+        )
         dialog.yesButton.setText("确定")
 
-        editor = LineEdit()
-        editor.setText(self.load_proxy())
-        editor.setClearButtonEnabled(True)
-        editor.setPlaceholderText("例如: http://127.0.0.1:7897")
-        dialog.viewLayout.addWidget(dialog.titleLabel)
-        dialog.viewLayout.addWidget(editor)
-        dialog.widget.setMinimumWidth(420)
-
         if dialog.exec():
-            new_proxy = editor.text().strip()
+            new_proxy = dialog.get_text()
             self.proxy_card.setContent(new_proxy or "未设置")
 
     def _edit_token(self):
-        dialog = MessageBoxBase(self)
-        dialog.titleLabel = SubtitleLabel("编辑访问令牌")
-        dialog.cancelButton.setText("取消")
+        dialog = InputDialog(
+            "编辑访问令牌",
+            placeholder="支持 GitHub / Gitee Token",
+            default=self.load_token(),
+            parent=self,
+        )
         dialog.yesButton.setText("确定")
 
-        editor = LineEdit()
-        editor.setText(self.load_token())
-        editor.setClearButtonEnabled(True)
-        editor.setPlaceholderText("支持 GitHub / Gitee Token")
-        dialog.viewLayout.addWidget(dialog.titleLabel)
-        dialog.viewLayout.addWidget(editor)
-        dialog.widget.setMinimumWidth(420)
-
         if dialog.exec():
-            new_token = editor.text().strip()
+            new_token = dialog.get_text()
             self.token_card.setContent(self._mask_token(new_token))
 
     def _reset_settings(self):
@@ -643,8 +657,9 @@ class GitManager(MSFluentWindow):
 
     def show_update_complete(self, repo_name: str, success: bool, message: str):
         if success:
+            detail = message or "已是最新版本"
             InfoBar.success(
-                "更新成功", f"{repo_name} 已是最新版本", duration=4000, parent=self
+                "更新成功", f"{repo_name} {detail}", duration=4000, parent=self
             )
         else:
             InfoBar.error(
@@ -656,7 +671,7 @@ class GitManager(MSFluentWindow):
 
     def show_clone_dialog(self):
         """打开克隆仓库对话框，对话框内部管理整个克隆生命周期。"""
-        dialog = CloneRepoDialog(self)
+        dialog = CloneRepoDialog(self, parent=self)
         dialog.exec()
 
     def get_selected_repo(self):
@@ -698,8 +713,7 @@ class GitManager(MSFluentWindow):
         """创建更新按钮（只显示图标）。使用repo_path而不是row作为标识"""
         btn = ToolButton(FIF.UPDATE)
         btn.setFixedWidth(85)
-        btn.installEventFilter(ToolTipFilter(btn, 0, ToolTipPosition.BOTTOM))
-        btn.setToolTip("更新仓库")
+        apply_tooltip(btn, "更新该仓库", position=ToolTipPosition.BOTTOM)
         btn.clicked.connect(lambda: self.update_single_repo(repo_path))
         self.table.takeItem(row, 6)
         self.table.setCellWidget(row, 6, btn)
@@ -773,6 +787,10 @@ class GitManager(MSFluentWindow):
                 )
             return
 
+        self._start_updates(to_update, skipped)
+
+    def _start_updates(self, to_update: list[str], skipped: int):
+        """提交一批仓库到更新线程池并提示。"""
         for repo in to_update:
             self.executor.submit(self.pull_repo, repo)
         logger.info(f"[批量更新] 已提交 {len(to_update)} 个仓库")
@@ -782,6 +800,33 @@ class GitManager(MSFluentWindow):
             + (f"（跳过 {skipped} 个已忽略）" if skipped else ""),
             parent=self,
         )
+
+    def update_all_repos(self):
+        """一键更新：更新所有处于"可更新"状态的仓库（跳过已忽略）。"""
+        if not self._repo_cache:
+            InfoBar.warning("提示", "请先扫描仓库", parent=self)
+            return
+
+        to_update: list[str] = []
+        skipped = 0
+        for repo, cache in self._repo_cache.items():
+            if cache.get("status") != "可更新":
+                continue
+            if self.is_repo_ignored(repo):
+                skipped += 1
+            else:
+                to_update.append(repo)
+
+        if not to_update:
+            if skipped:
+                InfoBar.warning(
+                    "提示", f"共 {skipped} 个可更新仓库均已设置忽略更新", parent=self
+                )
+            else:
+                InfoBar.success("提示", "所有仓库均已是最新版本", parent=self)
+            return
+
+        self._start_updates(to_update, skipped)
 
     def on_context_menu(self, pos):
         item = self.table.itemAt(pos)
@@ -1010,6 +1055,11 @@ class GitManager(MSFluentWindow):
 
     def verify_proxy_settings(self):
         """验证代理设置和GitHub连接性"""
+        # 上一次验证仍在进行 → 忽略重复点击，避免线程引用错乱
+        if self._proxy_verify_thread and self._proxy_verify_thread.isRunning():
+            InfoBar.info("提示", "正在验证中，请稍候...", parent=self)
+            return
+
         proxy = self.load_proxy()
 
         # 显示验证开始
@@ -1045,12 +1095,12 @@ class GitManager(MSFluentWindow):
 
     # ====================== 数据加载与按钮状态控制 ======================
     def load_repo_info(self, repo_path: str, generation: int | None = None):
-        """加载仓库信息。自动查找当前行号，不需要显式传递row"""
+        """加载仓库信息（线程安全：可在工作线程调用）。
+
+        只执行 git 检查并通过信号回传结果；表格行号由
+        update_table_row 在主线程内根据 repo_path 查找。
+        """
         repo_path = os.path.abspath(repo_path)
-        row = self.get_row_by_repo_path(repo_path)
-        if row == -1:
-            logger.warning(f"未找到仓库行: {repo_path}")
-            return
 
         need_update = False
         ignored = False
@@ -1062,7 +1112,6 @@ class GitManager(MSFluentWindow):
             ignored = repo_status.ignored
 
             self.update_row_signal.emit(
-                row,
                 repo_path,
                 repo_status.branch,
                 repo_status.local_commit,
@@ -1074,7 +1123,7 @@ class GitManager(MSFluentWindow):
         except Exception as e:
             logger.error(f"加载失败 {repo_path}: {str(e)}")
             self.update_row_signal.emit(
-                row, repo_path, "N/A", "错误", "N/A", "错误", "N/A", ""
+                repo_path, "N/A", "错误", "N/A", "错误", "N/A", ""
             )
         finally:
             if generation is not None:
@@ -1082,7 +1131,6 @@ class GitManager(MSFluentWindow):
 
     def update_table_row(
         self,
-        row: int,
         repo: str,
         branch: str,
         local: str,
@@ -1091,7 +1139,9 @@ class GitManager(MSFluentWindow):
         ahead_behind: str,
         remote_url: str = "",
     ):
-        if row >= self.table.rowCount():
+        row = self.get_row_by_repo_path(repo)
+        if row == -1:
+            logger.debug(f"[刷新] 仓库不在表格中，跳过: {repo}")
             return
 
         old_check_item = self.table.item(row, 0)
@@ -1137,14 +1187,12 @@ class GitManager(MSFluentWindow):
             status_item.setForeground(QColor("#9e9e9e"))
 
         # 按钮状态控制
+        # 注意：不要用 setStyleSheet 覆盖（会破坏 Fluent 暗色样式表），
+        # qfluentwidgets 控件自带正确的禁用态灰显
         btn = self.table.cellWidget(row, 6)
         if btn:
             btn.setEnabled(is_updatable)
-            if not is_updatable:
-                btn.setStyleSheet("opacity: 0.5;")
-            else:
-                btn.setStyleSheet("")
-
+                
         # 更新缓存
         self._repo_cache[repo] = {
             "name": repo_name,
@@ -1172,7 +1220,18 @@ class GitManager(MSFluentWindow):
 
         if result.success:
             logger.success(f"{repo} 更新成功")
-            self.update_complete_signal.emit(result.repo_name, True, "")
+            self.update_complete_signal.emit(
+                result.repo_name, True, result.message
+            )
+            if result.file_warning:
+                logger.warning(
+                    f"[完整性检查] {result.repo_name}: {result.file_warning}"
+                )
+                self.notify_signal.emit(
+                    "warning",
+                    "仓库变动警告",
+                    f"{result.repo_name}\n{result.file_warning}",
+                )
         else:
             logger.error(f"{repo} 更新失败\n{result.message}")
             self.update_complete_signal.emit(result.repo_name, False, result.message)
@@ -1185,8 +1244,21 @@ class GitManager(MSFluentWindow):
 
         if col == 2:  # 当前分支 → 分支管理
             BranchDialog(repo, self).exec()
-        elif col == 3:  # 当前版本 → 历史
-            HistoryDialog(repo, self).exec()
+        elif col == 3:  # 当前版本 → 版本历史页面
+            self.show_history_page(repo)
+
+    def show_history_page(self, repo: str):
+        """打开独立的版本历史弹出窗口（QDialog，复用同一实例）。"""
+        if not repo or repo == "...":
+            InfoBar.warning("提示", "请先扫描仓库", parent=self)
+            return
+        if self._history_window is None:
+            # parent=self：获得窗口所有权（主窗口关闭时一并销毁）
+            self._history_window = HistoryWindow(self, parent=self)
+        self._history_window.load_repo(repo)
+        self._history_window.show()
+        self._history_window.raise_()
+        self._history_window.activateWindow()
 
     def switch_to_commit(self, repo: str, commit: str, dialog=None):
         logger.warning(f"硬重置 {repo} → {commit}")
@@ -1214,9 +1286,7 @@ class GitManager(MSFluentWindow):
             InfoBar.warning("提示", "分支名称为空", parent=self)
             return
 
-        result = self.git_service.switch_branch(
-            repo, branch_name, is_remote=is_remote
-        )
+        result = self.git_service.switch_branch(repo, branch_name, is_remote=is_remote)
         if result.already_active:
             InfoBar.warning("提示", "当前已经在该分支", parent=self)
             if dialog:
@@ -1230,9 +1300,7 @@ class GitManager(MSFluentWindow):
             InfoBar.success("成功", f"已切换到 {branch_name}", parent=self)
         else:
             logger.error(f"分支切换失败: {result.error}")
-            InfoBar.error(
-                "失败", (result.error or "分支切换失败")[:150], parent=self
-            )
+            InfoBar.error("失败", (result.error or "分支切换失败")[:150], parent=self)
 
         try:
             self.load_repo_info(repo, None)
@@ -1245,6 +1313,8 @@ class GitManager(MSFluentWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    # 在创建任何窗口/控件前设置暗色主题，避免控件先按亮色初始化再切换
+    setTheme(Theme.DARK)
     window = GitManager()
     window.center_window()
     window.show()

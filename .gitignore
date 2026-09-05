@@ -35,6 +35,7 @@ releases/
 # Config files (if contains sensitive info)
 config.json
 .env
+*.json
 
 # Python-generated files
 __pycache__/
@@ -58,3 +59,11 @@ config.json
 
 repo_cache.json
 reword.py
+
+# Batch scripts
+*.bat
+
+# Icons
+*.ico
+*.icon
+*.png
