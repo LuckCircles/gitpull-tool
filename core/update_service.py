@@ -33,6 +33,8 @@ import shutil
 import time
 from dataclasses import dataclass
 
+from loguru import logger
+
 from core.git_service import GitService
 
 # pull / fetch 超时（秒）：大仓库 rebase/autostash 较慢，
@@ -97,6 +99,7 @@ class UpdateService:
             return UpdateResult(repo_abs, repo_name, False, "该仓库已设置忽略更新")
 
         if os.path.exists(os.path.join(repo_abs, ".git", "MERGE_HEAD")):
+            logger.warning(f"[更新] {repo_name}: 存在未完成的 merge，拒绝更新")
             return UpdateResult(
                 repo_abs,
                 repo_name,
@@ -118,6 +121,10 @@ class UpdateService:
 
         files_before = self._count_tracked_files(repo_abs)
         before_sha = self._current_head(repo_abs)
+        logger.debug(
+            f"[更新] {repo_name}: 脏工作区={has_tracked_changes}, "
+            f"HEAD={before_sha[:8] or '?'}, 已跟踪文件={files_before}"
+        )
 
         # pull 持仓库锁，与扫描线程的 fetch 串行化
         with self._git_service.repo_lock(repo_abs):
@@ -126,11 +133,17 @@ class UpdateService:
             # 远端删库/归档预检验（返回非空 = 阻断原因）
             block_reason = self._check_remote_health(repo_abs)
             if block_reason:
+                logger.warning(f"[更新] {repo_name}: 预检验阻断 — {block_reason}")
                 return UpdateResult(repo_abs, repo_name, False, block_reason)
 
             output, error, code = self._pull_with_retry(
                 repo_abs, autostash=has_tracked_changes
             )
+            if code != 0:
+                logger.warning(
+                    f"[更新] {repo_name}: pull 失败 rc={code} — "
+                    f"{self._format_pull_error(error, output)[:200]}"
+                )
 
             # 失败善后：恢复 rebase 中间状态（autostash 会一并恢复）
             if code != 0 and self._abort_stale_rebase(repo_abs):
@@ -141,6 +154,10 @@ class UpdateService:
             # 本地无改动时自动回滚，保护本地代码
             if not has_tracked_changes and before_sha:
                 if self._rollback_if_archived(repo_abs, before_sha, files_before):
+                    logger.warning(
+                        f"[更新] {repo_name}: pull 后远端仅剩说明文档，"
+                        f"已回滚到 {before_sha[:8]}"
+                    )
                     return UpdateResult(
                         repo_abs,
                         repo_name,
@@ -152,6 +169,8 @@ class UpdateService:
                     )
 
             warning = self._check_repo_integrity(repo_abs, files_before)
+            if warning:
+                logger.warning(f"[更新] {repo_name}: 完整性检查 — {warning}")
             if has_tracked_changes:
                 message = "已自动暂存本地改动并在更新后恢复"
             elif before_sha:
@@ -300,6 +319,10 @@ class UpdateService:
 
         # 网络类错误（超时/断连/代理故障）→ 退避后重试一次
         if self._is_network_error(error, output):
+            logger.info(
+                f"[更新] {os.path.basename(repo_abs)}: 网络错误，"
+                f"{NETWORK_RETRY_DELAY}s 后重试 — {self._format_pull_error(error, output)[:150]}"
+            )
             time.sleep(NETWORK_RETRY_DELAY)
             return self._pull_once(repo_abs, args)
         return output, error, code
@@ -313,6 +336,9 @@ class UpdateService:
             return output, error, code
 
         # lock 冲突（多为外部 git 进程瞬时占用或上次残留）→ 清理后重试
+        logger.info(
+            f"[更新] {os.path.basename(repo_abs)}: 遇到 lock 冲突，清理后重试"
+        )
         self._clear_locks(repo_abs)
         return self._git_service.run_git(repo_abs, args, timeout=PULL_TIMEOUT)
 
@@ -368,6 +394,9 @@ class UpdateService:
 
         try:
             os.remove(lock)
+            logger.info(
+                f"[更新] {os.path.basename(repo_abs)}: 清理陈旧 index.lock 后继续"
+            )
         except OSError:
             pass  # 删除失败（被占用等），交由 pull 失败后的重试兜底
 
@@ -401,6 +430,9 @@ class UpdateService:
         if not any(os.path.exists(p) for p in paths):
             return False
 
+        logger.info(
+            f"[更新] {os.path.basename(repo_abs)}: 检测到未完成的 rebase，自动恢复"
+        )
         self._git_service.run_git(repo_abs, ["rebase", "--abort"])
         if not any(os.path.exists(p) for p in paths):
             return True

@@ -13,10 +13,14 @@ import os
 import subprocess
 import sys
 import threading
+import time
 
 from loguru import logger
 
 from utils.subprocess_utils import build_hidden_subprocess_kwargs, run_hidden
+
+# 调试日志中 stderr 摘录的最大长度（避免刷屏）
+_STDERR_SNIPPET = 400
 
 
 class GitRunner:
@@ -52,6 +56,7 @@ class GitRunner:
         if self._is_closing:
             return "", "Application is closing", -1
 
+        started = time.perf_counter()
         try:
             process_env = os.environ.copy()
             process_env.setdefault("PYTHONIOENCODING", "utf-8")
@@ -82,10 +87,12 @@ class GitRunner:
             finally:
                 self._unregister_process(proc)
 
+            self._log_command(cmd, cwd, proc.returncode, started, stderr)
             return (stdout or "").strip(), (stderr or "").strip(), proc.returncode
 
         except Exception as e:
-            logger.error(f"命令执行失败: {str(e)}")
+            logger.error(f"命令执行失败: {' '.join(cmd)}")
+            logger.opt(exception=e).debug("命令执行异常栈")
             return "", str(e), -1
 
     def run_git(self, path: str, args: list, timeout=60):
@@ -97,12 +104,39 @@ class GitRunner:
     # ------------------------------------------------------------------
     @staticmethod
     def run_simple(cmd, **kwargs):
-        """执行一次性命令，返回 subprocess.CompletedProcess。"""
-        return run_hidden(cmd, **kwargs)
+        """执行一次性命令并记录调试日志（返回 CompletedProcess）。"""
+        started = time.perf_counter()
+        result = run_hidden(cmd, **kwargs)
+        GitRunner._log_command(
+            list(cmd),
+            kwargs.get("cwd"),
+            result.returncode,
+            started,
+            result.stderr if hasattr(result, "stderr") else None,
+        )
+        return result
 
     # ------------------------------------------------------------------
     # 进程管理（内部）
     # ------------------------------------------------------------------
+    @staticmethod
+    def _log_command(
+        cmd: list[str],
+        cwd: str | None,
+        returncode: int | None,
+        started: float,
+        stderr: str | None,
+    ):
+        """记录一次命令执行的调试日志（命令、目录、返回码、耗时）。"""
+        elapsed = time.perf_counter() - started
+        text = " ".join(str(c) for c in cmd)
+        where = f" @ {cwd}" if cwd else ""
+        logger.debug(f"[cmd] rc={returncode} {elapsed:.2f}s{where}: {text}")
+        if returncode not in (0, None) and stderr:
+            snippet = str(stderr).strip().replace("\n", " | ")[:_STDERR_SNIPPET]
+            if snippet:
+                logger.debug(f"[cmd] stderr: {snippet}")
+
     def _register_process(self, proc: subprocess.Popen):
         with self._process_lock:
             self._active_processes.add(proc)

@@ -8,7 +8,7 @@ import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 
 from loguru import logger
-from PySide6.QtCore import QObject, Qt, QThread, Signal
+from PySide6.QtCore import QObject, Qt, QThread, QtMsgType, Signal, qInstallMessageHandler
 from PySide6.QtGui import QColor, QIcon, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
@@ -28,6 +28,7 @@ from qfluentwidgets import Action
 from qfluentwidgets import FluentIcon as FIF
 from qfluentwidgets import (
     HorizontalSeparator,
+    HyperlinkCard,
     InfoBar,
     MSFluentWindow,
     NavigationItemPosition,
@@ -60,6 +61,7 @@ from ui.widgets.history_page import HistoryWindow
 from ui.dialogs.rename_dialog import RenameRepoDialog
 from ui.widgets.dark_window import InputDialog, apply_tooltip
 from workers.proxy_verify_worker import ProxyVerifyWorker
+from workers.token_verify_worker import TokenVerifyWorker
 
 
 class QtLogHandler(QObject):
@@ -78,6 +80,23 @@ class QtLogHandler(QObject):
         cursor = self.text_edit.textCursor()
         cursor.movePosition(QTextCursor.End)
         self.text_edit.setTextCursor(cursor)
+
+
+# Qt 消息类型 → 日志级别（捕获 Qt 内部警告/错误，便于排查渲染与信号问题）
+_QT_LOG_LEVELS = {
+    QtMsgType.QtDebugMsg: "DEBUG",
+    QtMsgType.QtInfoMsg: "INFO",
+    QtMsgType.QtWarningMsg: "WARNING",
+    QtMsgType.QtCriticalMsg: "ERROR",
+    QtMsgType.QtFatalMsg: "ERROR",
+}
+
+
+def _qt_message_handler(msg_type, context, message):
+    """将 Qt 内部消息路由到日志文件（含源码位置）。"""
+    level = _QT_LOG_LEVELS.get(msg_type, "DEBUG")
+    where = f" ({context.file}:{context.line})" if context.file else ""
+    logger.log(level, f"[Qt] {message}{where}")
 
 
 # ====================== 主窗口 ======================
@@ -116,7 +135,8 @@ class GitManager(MSFluentWindow):
         self._scan_need_update = 0
         self._scan_ignored = 0
         self._proxy_verify_thread = None  # 代理验证线程
-        self._history_window: HistoryWindow | None = None  # 版本历史独立窗口
+        self._token_verify_thread = None  # 令牌验证线程
+        self._history_window: HistoryWindow | None = None  # 版本历史弹出窗口（复用）
 
         self.init_ui()
         self.apply_proxy(self.load_proxy())
@@ -124,7 +144,8 @@ class GitManager(MSFluentWindow):
         self.qt_handler = QtLogHandler(self.log_text)
         logger.add(
             self.qt_handler.write,
-            level="DEBUG",
+            # 面板仅显示 INFO 及以上；git 命令等 DEBUG 细节写入日志文件
+            level="INFO",
             format="{time:HH:mm:ss} | <level>{level:8}</level> | {message}",
         )
         logger.success("Git 多仓库管理器启动成功")
@@ -138,8 +159,18 @@ class GitManager(MSFluentWindow):
     def closeEvent(self, event):
         self.executor.shutdown(wait=False, cancel_futures=True)
         self.git_service.shutdown()
+        # 等待验证线程结束，避免退出时 QThread 被析构导致崩溃
+        for thread in (self._proxy_verify_thread, self._token_verify_thread):
+            if thread is not None and thread.isRunning():
+                thread.quit()
+                thread.wait()
+        # 等待弹窗后台线程结束，避免退出时 QThread 被析构导致崩溃
+        if self._history_window is not None:
+            self._history_window.shutdown()
+        BranchDialog.shutdown_active_workers()
         # 保存仓库缓存
         save_repo_cache(list(self._repo_cache.values()))
+        logger.complete()  # 等待队列中的日志全部落盘
         logger.remove()
         super().closeEvent(event)
 
@@ -220,12 +251,6 @@ class GitManager(MSFluentWindow):
             self._save_cached_config()
         except Exception as e:
             logger.warning(f"保存配置失败: {str(e)}")
-
-    def save_settings(self, base_dir: str, proxy: str, token: str):
-        self._config_cache["base_dir"] = base_dir
-        self._config_cache["proxy"] = proxy
-        self._config_cache["token"] = token
-        self._save_cached_config()
 
     def init_ui(self):
         # MSFluentWindow：导航栏/标题栏/堆叠窗口均由基类内置
@@ -368,6 +393,17 @@ class GitManager(MSFluentWindow):
         self.token_card.clicked.connect(self._edit_token)
         self.network_group.addSettingCard(self.token_card)
 
+        # 验证令牌卡片
+        self.verify_token_card = PushSettingCard(
+            "验证令牌",
+            FIF.CERTIFICATE,
+            "验证令牌可用性",
+            "验证 GitHub / Gitee 访问令牌是否有效",
+            self.network_group,
+        )
+        self.verify_token_card.clicked.connect(self.verify_token_settings)
+        self.network_group.addSettingCard(self.verify_token_card)
+
         self.proxy_switch = SwitchSettingCard(
             FIF.POWER_BUTTON,
             "启用代理",
@@ -382,42 +418,16 @@ class GitManager(MSFluentWindow):
 
         # ========== 关于 ==========
         self.about_group = SettingCardGroup("关于", self.settings_page)
-        self.about_card = PushSettingCard(
-            "查看",
+        self.about_card = HyperlinkCard(
+            "https://github.com/LuckCircles/gitpull-tool",
+            "关于工具",
             FIF.INFO,
             "Git 多仓库管理器",
-            "高级版 · 支持批量管理、分支切换、版本回退",
+            "高级版 · 基于 PySide6 + FluentWidgets 构建，支持批量管理、分支切换、版本回退",
             self.about_group,
-        )
-        self.about_card.clicked.connect(
-            lambda: InfoBar.info(
-                "关于",
-                "Git 多仓库管理器 v2.0\n基于 PySide6 + FluentWidgets 构建",
-                parent=self,
-            )
         )
         self.about_group.addSettingCard(self.about_card)
         settings_layout.addWidget(self.about_group)
-
-        # ========== 底部保存按钮 ==========
-        bottom_widget = QWidget()
-        bottom_layout = QHBoxLayout(bottom_widget)
-        bottom_layout.setContentsMargins(0, 8, 0, 0)
-
-        self.save_btn = PrimaryPushButton(FIF.SAVE, "保存设置")
-        self.save_btn.setMinimumWidth(160)
-        apply_tooltip(self.save_btn, "保存设置页的配置")
-        self.save_btn.clicked.connect(self.apply_settings_from_page)
-
-        self.reset_btn = PushButton(FIF.CANCEL, "重置")
-        self.reset_btn.setMinimumWidth(100)
-        apply_tooltip(self.reset_btn, "恢复为上次保存的配置")
-        self.reset_btn.clicked.connect(self._reset_settings)
-
-        bottom_layout.addStretch()
-        bottom_layout.addWidget(self.reset_btn)
-        bottom_layout.addWidget(self.save_btn)
-        settings_layout.addWidget(bottom_widget)
 
         settings_layout.addStretch(1)
 
@@ -496,29 +506,13 @@ class GitManager(MSFluentWindow):
     def select_settings_dir(self):
         path = QFileDialog.getExistingDirectory(self, "选择目录", self.base_dir)
         if path:
+            # 选择即保存并应用
+            self.base_dir = path
+            self.dir_label.setText(f"目录: {self.base_dir}")
             self.dir_card.setContent(path)
-
-    def apply_settings_from_page(self):
-        base_dir = self.dir_card.contentLabel.text().strip() or self.base_dir
-        proxy = self.proxy_card.contentLabel.text().strip()
-        token = self.token_card.contentLabel.text().strip()
-        proxy_enabled = self.proxy_switch.isChecked()
-
-        if proxy == "未设置":
-            proxy = ""
-
-        if token == "未设置":
-            token = ""
-
-        self.base_dir = base_dir
-        self.dir_label.setText(f"目录: {self.base_dir}")
-        self.save_settings(base_dir, proxy, token)
-        if proxy_enabled and proxy:
-            self.apply_proxy(proxy)
-        else:
-            self.clear_proxy()
-        logger.success("设置已保存")
-        InfoBar.success("成功", "设置已保存并应用", parent=self)
+            self._config_cache["base_dir"] = path
+            self._save_cached_config()
+            logger.success(f"仓库存放目录已更新: {path}")
 
     def _edit_proxy(self):
         dialog = InputDialog(
@@ -530,8 +524,16 @@ class GitManager(MSFluentWindow):
         dialog.yesButton.setText("确定")
 
         if dialog.exec():
-            new_proxy = dialog.get_text()
+            new_proxy = dialog.get_text().strip()
+            # 确认即保存并应用
+            self._config_cache["proxy"] = new_proxy
+            self._save_cached_config()
             self.proxy_card.setContent(new_proxy or "未设置")
+            if self.proxy_switch.isChecked() and new_proxy:
+                self.apply_proxy(new_proxy)
+            else:
+                self.clear_proxy()
+            logger.success("代理地址已更新")
 
     def _edit_token(self):
         dialog = InputDialog(
@@ -543,16 +545,12 @@ class GitManager(MSFluentWindow):
         dialog.yesButton.setText("确定")
 
         if dialog.exec():
-            new_token = dialog.get_text()
+            new_token = dialog.get_text().strip()
+            # 确认即保存（卡片仅显示掩码）
+            self._config_cache["token"] = new_token
+            self._save_cached_config()
             self.token_card.setContent(self._mask_token(new_token))
-
-    def _reset_settings(self):
-        self.proxy_card.setContent(self.load_proxy() or "未设置")
-        token = self.load_token()
-        self.token_card.setContent(self._mask_token(token))
-        self.dir_card.setContent(self.base_dir)
-        self.proxy_switch.setChecked(True)
-        InfoBar.info("提示", "已重置为当前保存的设置", parent=self)
+            logger.success("访问令牌已更新")
 
     def _on_proxy_toggle(self, checked: bool):
         proxy = self.proxy_card.contentLabel.text().strip()
@@ -606,10 +604,12 @@ class GitManager(MSFluentWindow):
             row = self.table.rowCount()
             self.table.insertRow(row)
             for c in range(7):
-                item = QTableWidgetItem("...")
-                # 在第1列设置repo_path作为UserRole数据
                 if c == 1:
+                    # 仓库名扫描时立即可见，无需等待后台加载
+                    item = QTableWidgetItem(candidate.name)
                     item.setData(Qt.UserRole, candidate.path)
+                else:
+                    item = QTableWidgetItem("...")
                 self.table.setItem(row, c, item)
             self._add_update_button(row, candidate.path)
 
@@ -727,8 +727,16 @@ class GitManager(MSFluentWindow):
         self.repos.append(repo_path)
         row = self.table.rowCount()
         self.table.insertRow(row)
+        name = os.path.basename(repo_path.rstrip("\\/")) or repo_path
         for c in range(7):
-            self.table.setItem(row, c, QTableWidgetItem("..."))
+            if c == 1:
+                # 名称立即可见；UserRole 必须在此处设置，
+                # 否则 update_table_row 按 path 查找行号会失败
+                item = QTableWidgetItem(name)
+                item.setData(Qt.UserRole, repo_path)
+            else:
+                item = QTableWidgetItem("...")
+            self.table.setItem(row, c, item)
         self._add_update_button(row, repo_path)
         # 撤销搜索过滤确保新行可见
         self.search_edit.clear()
@@ -1093,24 +1101,99 @@ class GitManager(MSFluentWindow):
             InfoBar.error("验证失败", message[:150], parent=self)
             logger.error(f"代理验证失败: {message}")
 
+    def verify_token_settings(self):
+        """验证访问令牌可用性"""
+        # 上一次验证仍在进行 → 忽略重复点击，避免线程引用错乱
+        if self._token_verify_thread and self._token_verify_thread.isRunning():
+            InfoBar.info("提示", "正在验证中，请稍候...", parent=self)
+            return
+
+        token = self.load_token()
+        if not token:
+            InfoBar.warning("提示", "未设置令牌，请先编辑访问令牌", parent=self)
+            return
+
+        # 显示验证开始
+        InfoBar.info("验证中...", "正在验证令牌可用性，请稍候...", parent=self)
+
+        # 创建工作线程（启用代理时携带代理地址）
+        proxy = self.load_proxy() if self.proxy_switch.isChecked() else None
+        self._token_verify_worker = TokenVerifyWorker(token, proxy, timeout=10)
+        self._token_verify_thread = QThread()
+        self._token_verify_worker.moveToThread(self._token_verify_thread)
+
+        # 连接信号
+        self._token_verify_worker.finished.connect(self._on_token_verify_finished)
+        self._token_verify_thread.started.connect(self._token_verify_worker.run)
+
+        # 启动线程
+        self._token_verify_thread.start()
+
+    def _on_token_verify_finished(self, success: bool, message: str):
+        """令牌验证完成回调"""
+        # 清理线程
+        if self._token_verify_thread:
+            self._token_verify_thread.quit()
+            self._token_verify_thread.wait()
+            self._token_verify_thread = None
+
+        # 显示结果
+        if success:
+            InfoBar.success("验证成功", message, parent=self)
+            logger.success(f"令牌验证通过: {message}")
+        else:
+            InfoBar.error("验证失败", message[:150], parent=self)
+            logger.error(f"令牌验证失败: {message}")
+
     # ====================== 数据加载与按钮状态控制 ======================
     def load_repo_info(self, repo_path: str, generation: int | None = None):
-        """加载仓库信息（线程安全：可在工作线程调用）。
+        """加载仓库信息（线程安全：可在工作线程调用）——阶段1：本地信息先行。
 
-        只执行 git 检查并通过信号回传结果；表格行号由
-        update_table_row 在主线程内根据 repo_path 查找。
+        只做本地 git 读取（分支/版本/远端地址，毫秒级、无网络），立即回传，
+        状态列显示 "⏳ 同步中"。阶段2（fetch 远端）作为独立任务提交，
+        避免慢速 fetch 阻塞其他仓库的阶段1 展示。
+        行号由 update_table_row 在主线程内根据 repo_path 查找。
         """
         repo_path = os.path.abspath(repo_path)
 
-        need_update = False
-        ignored = False
         try:
-            repo_status = self.git_service.inspect_repository(
-                repo_path, ignored=self.is_repo_ignored(repo_path)
+            ignored = self.is_repo_ignored(repo_path)
+            local = self.git_service.inspect_repository(
+                repo_path, ignored=ignored, fetch=False
             )
-            need_update = repo_status.need_update
-            ignored = repo_status.ignored
+            self.update_row_signal.emit(
+                repo_path,
+                local.branch,
+                local.local_commit,
+                local.remote_commit,
+                local.status,
+                local.ahead_behind,
+                local.remote_url,
+            )
 
+            if local.ignored:
+                # 忽略更新的仓库：本地信息即最终结果，无需 fetch
+                if generation is not None:
+                    self._mark_scan_progress(generation, False, True)
+            else:
+                # 阶段2 独立提交：所有仓库的阶段1 先行完成，fetch 再排队
+                self.executor.submit(self._sync_repo_info, repo_path, generation)
+        except Exception as e:
+            logger.error(f"加载失败 {repo_path}: {str(e)}")
+            self.update_row_signal.emit(
+                repo_path, "N/A", "错误", "N/A", "错误", "N/A", ""
+            )
+            if generation is not None:
+                self._mark_scan_progress(generation, False, False)
+
+    def _sync_repo_info(self, repo_path: str, generation: int | None = None):
+        """阶段2：fetch 远端后填充最终同步状态（线程安全）。"""
+        repo_path = os.path.abspath(repo_path)
+
+        need_update = False
+        try:
+            repo_status = self.git_service.inspect_repository(repo_path)
+            need_update = repo_status.need_update
             self.update_row_signal.emit(
                 repo_path,
                 repo_status.branch,
@@ -1121,13 +1204,13 @@ class GitManager(MSFluentWindow):
                 repo_status.remote_url,
             )
         except Exception as e:
-            logger.error(f"加载失败 {repo_path}: {str(e)}")
+            logger.error(f"同步状态失败 {repo_path}: {str(e)}")
             self.update_row_signal.emit(
                 repo_path, "N/A", "错误", "N/A", "错误", "N/A", ""
             )
         finally:
             if generation is not None:
-                self._mark_scan_progress(generation, need_update, ignored)
+                self._mark_scan_progress(generation, need_update, False)
 
     def update_table_row(
         self,
@@ -1248,7 +1331,7 @@ class GitManager(MSFluentWindow):
             self.show_history_page(repo)
 
     def show_history_page(self, repo: str):
-        """打开独立的版本历史弹出窗口（QDialog，复用同一实例）。"""
+        """打开版本历史弹出窗口（Fluent 遮罩弹窗，复用同一实例）。"""
         if not repo or repo == "...":
             InfoBar.warning("提示", "请先扫描仓库", parent=self)
             return
@@ -1257,8 +1340,6 @@ class GitManager(MSFluentWindow):
             self._history_window = HistoryWindow(self, parent=self)
         self._history_window.load_repo(repo)
         self._history_window.show()
-        self._history_window.raise_()
-        self._history_window.activateWindow()
 
     def switch_to_commit(self, repo: str, commit: str, dialog=None):
         logger.warning(f"硬重置 {repo} → {commit}")
@@ -1277,7 +1358,7 @@ class GitManager(MSFluentWindow):
             pass
 
         if dialog:
-            dialog.close()
+            dialog.reject()
 
     def switch_to_branch(self, repo: str, branch_info: dict, dialog=None):
         branch_name = branch_info.get("name", "")
@@ -1290,7 +1371,7 @@ class GitManager(MSFluentWindow):
         if result.already_active:
             InfoBar.warning("提示", "当前已经在该分支", parent=self)
             if dialog:
-                dialog.close()
+                dialog.reject()
             return
 
         logger.info(f"切换分支 {repo} → {branch_name}")
@@ -1308,11 +1389,13 @@ class GitManager(MSFluentWindow):
             pass
 
         if dialog and result.success:
-            dialog.close()
+            dialog.accept()
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    # 捕获 Qt 内部警告/错误到日志文件（需在创建任何 Qt 对象前安装）
+    qInstallMessageHandler(_qt_message_handler)
     # 在创建任何窗口/控件前设置暗色主题，避免控件先按亮色初始化再切换
     setTheme(Theme.DARK)
     window = GitManager()

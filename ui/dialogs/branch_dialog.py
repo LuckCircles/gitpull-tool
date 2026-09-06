@@ -1,4 +1,4 @@
-"""分支管理对话框 — 分支列表后台线程加载。
+"""分支管理对话框 — Fluent 遮罩弹窗 + 分支列表后台线程加载。
 
 fetch 是网络操作（超时 30s），在主线程执行会冻结整个窗口，
 因此加载流程放入 QThread，通过 Signal/Slot 回传结果。
@@ -10,23 +10,20 @@ from loguru import logger
 from PySide6.QtCore import QObject, Qt, QThread, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QHBoxLayout,
     QHeaderView,
     QTableWidget,
     QTableWidgetItem,
-    QVBoxLayout,
 )
-from qfluentwidgets import FluentIcon as FIF
 from qfluentwidgets import (
     IndeterminateProgressBar,
-    PrimaryPushButton,
+    MessageBoxBase,
     PushButton,
     StrongBodyLabel,
     TableWidget,
 )
 
 from core.git_runner import GitRunner
-from ui.widgets.dark_window import ConfirmDialog, DarkDialog, apply_tooltip
+from ui.widgets.dark_window import ConfirmDialog, MaskFadeGuardMixin, apply_tooltip
 
 
 class BranchWorker(QObject):
@@ -103,8 +100,8 @@ class BranchWorker(QObject):
         )
 
 
-class BranchDialog(DarkDialog):
-    """分支管理对话框（分支列表后台线程加载，UI 不冻结）"""
+class BranchDialog(MaskFadeGuardMixin, MessageBoxBase):
+    """分支管理对话框（Fluent 遮罩弹窗，分支列表后台线程加载，UI 不冻结）"""
 
     # 类级引用：对话框销毁后仍在执行的加载线程不被 GC
     #（对话框在 main.py 中以临时对象方式创建，exec 返回即被回收）
@@ -113,21 +110,19 @@ class BranchDialog(DarkDialog):
     def __init__(self, repo_path: str, parent=None):
         super().__init__(parent)
         self.repo_path = repo_path
-        self.setWindowTitle(f"分支管理 - {os.path.basename(repo_path)}")
-        self.resize(860, 560)
+        repo_name = os.path.basename(repo_path.rstrip("\\/"))
 
         self._thread: QThread | None = None
         self._worker: BranchWorker | None = None
 
-        layout = QVBoxLayout(self)
-        layout.setSpacing(12)
-        layout.setContentsMargins(16, 44, 16, 16)
+        self.widget.setFixedWidth(880)
 
-        layout.addWidget(StrongBodyLabel(f"仓库: {repo_path}"))
+        # 遮罩弹窗无标题栏，标题显示在内容区顶部
+        self.viewLayout.addWidget(StrongBodyLabel(f"分支管理 · {repo_name}"))
 
         self.progress = IndeterminateProgressBar()
         self.progress.setVisible(False)
-        layout.addWidget(self.progress)
+        self.viewLayout.addWidget(self.progress)
 
         self.table = TableWidget()
         self.table.setColumnCount(5)
@@ -135,6 +130,7 @@ class BranchDialog(DarkDialog):
             ["分支", "类型", "当前", "最新提交", "提交信息"]
         )
         self.table.verticalHeader().setVisible(False)
+        self.table.setFixedHeight(420)
 
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(
@@ -151,19 +147,19 @@ class BranchDialog(DarkDialog):
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.itemDoubleClicked.connect(self.on_double_click)
-        layout.addWidget(self.table)
+        self.viewLayout.addWidget(self.table)
 
-        btn_layout = QHBoxLayout()
-        self.switch_btn = PrimaryPushButton(FIF.UPDATE, "切换分支")
+        # 底部按钮：「切换分支」「关闭窗口」均为普通按钮
+        #（隐藏自带的主色 yesButton，在按钮区左侧插入普通按钮，等宽分布）
+        self.yesButton.hide()
+        self.switch_btn = PushButton("切换分支")
         apply_tooltip(self.switch_btn, "切换到选中的分支")
         self.switch_btn.clicked.connect(self.switch_to_branch)
-        self.close_btn = PushButton(FIF.CLOSE, "关闭窗口")
-        apply_tooltip(self.close_btn, "关闭分支管理窗口")
-        self.close_btn.clicked.connect(self.close)
-        btn_layout.addStretch()
-        btn_layout.addWidget(self.switch_btn)
-        btn_layout.addWidget(self.close_btn)
-        layout.addLayout(btn_layout)
+        self.switch_btn.setFocus()
+        self.buttonLayout.insertWidget(0, self.switch_btn, 1, Qt.AlignVCenter)
+
+        self.cancelButton.setText("关闭窗口")
+        apply_tooltip(self.cancelButton, "关闭分支管理窗口")
 
         self.load_branches()
 
@@ -241,8 +237,24 @@ class BranchDialog(DarkDialog):
                         font.setBold(True)
                         item.setFont(font)
 
-    def closeEvent(self, event):
-        """关闭时停止加载线程（引用由 _active_workers 持有直至结束）。"""
+    def done(self, code):
+        """关闭时停止仍在执行的加载线程（引用由 _active_workers 持有直至结束）。"""
+        self._stop_loading_thread()
+        super().done(code)
+
+    @classmethod
+    def shutdown_active_workers(cls, timeout_ms: int = 3000):
+        """应用退出前停止并等待所有仍在运行的加载线程（避免 QThread 析构崩溃）。"""
+        for thread, worker in list(cls._active_workers):
+            for sig in (worker.loaded, worker.failed):
+                try:
+                    sig.disconnect()
+                except (RuntimeError, TypeError):
+                    pass
+            thread.quit()
+            thread.wait(timeout_ms)
+
+    def _stop_loading_thread(self):
         thread, worker = self._thread, self._worker
         self._thread = self._worker = None
         if thread:
@@ -253,7 +265,6 @@ class BranchDialog(DarkDialog):
                     except (RuntimeError, TypeError):
                         pass
             thread.quit()
-        super().closeEvent(event)
 
     # ------------------------------------------------------------------
     # 分支切换

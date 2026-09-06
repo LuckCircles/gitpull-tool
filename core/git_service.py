@@ -91,9 +91,13 @@ class GitService:
         return self._runner.run_command(command, cwd=cwd, timeout=timeout, env=env)
 
     def inspect_repository(
-        self, repo_path: str, *, ignored: bool = False
+        self, repo_path: str, *, ignored: bool = False, fetch: bool = True
     ) -> RepoStatus:
-        """Read the status displayed for a repository during a scan."""
+        """Read the status displayed for a repository during a scan.
+
+        fetch=False 时仅读取本地信息（分支/版本/远端地址，毫秒级、无网络），
+        状态列返回 "⏳ 同步中"，供扫描两阶段加载先行展示仓库列表。
+        """
         repo_abs = os.path.abspath(repo_path)
         local_commit, _, _ = self.run_git(repo_abs, ["rev-parse", "--short", "HEAD"])
         branch, _, _ = self.run_git(repo_abs, ["branch", "--show-current"])
@@ -112,6 +116,19 @@ class GitService:
                 remote_url or "",
                 False,
                 True,
+            )
+
+        if not fetch:
+            return RepoStatus(
+                repo_abs,
+                branch,
+                local_commit or "N/A",
+                "...",
+                "⏳ 同步中",
+                "-",
+                remote_url or "",
+                False,
+                False,
             )
 
         # fetch 持仓库锁，与更新(pull)串行化，避免并发写 .git 产生 lock 冲突

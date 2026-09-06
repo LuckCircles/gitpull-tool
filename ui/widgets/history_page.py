@@ -1,7 +1,8 @@
-"""版本历史独立窗口 — SegmentedWidget 本地/远端历史导航（QWidget 弹出窗口，非对话框）。
+"""版本历史弹出窗口 — SegmentedWidget 本地/远端历史导航（Fluent 遮罩弹窗）。
 
 结构：
-    HistoryWindow (QWidget, 独立弹出窗口，原生标题栏)
+    HistoryWindow (MessageBoxBase 遮罩弹窗)
+      ├── 标题（版本历史 · 仓库名）
       ├── SegmentedWidget（"本地历史" / "远端历史" 切换，胶囊滑块动画）
       └── QStackedWidget
             ├── _CommitList(remote=False)  → git log HEAD
@@ -21,7 +22,7 @@ import os
 
 from loguru import logger
 from PySide6.QtCore import QObject, Qt, QThread, Signal
-from PySide6.QtGui import QColor, QIcon
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
@@ -34,14 +35,15 @@ from PySide6.QtWidgets import (
 )
 from qfluentwidgets import FluentIcon as FIF
 from qfluentwidgets import (
-    PrimaryPushButton,
+    MessageBoxBase,
+    PushButton,
     SegmentedWidget,
     StrongBodyLabel,
     TableWidget,
 )
 
 from core.git_runner import GitRunner
-from ui.widgets.dark_window import ConfirmDialog, DarkDialog, apply_tooltip
+from ui.widgets.dark_window import ConfirmDialog, MaskFadeGuardMixin, apply_tooltip
 
 LOG_LIMIT = 50
 
@@ -86,6 +88,7 @@ class _CommitList(QWidget):
 
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setFixedHeight(430)
         self.table.itemDoubleClicked.connect(lambda _: self.switch_to_version())
         layout.addWidget(self.table, 1)
 
@@ -94,10 +97,15 @@ class _CommitList(QWidget):
         self.hint_label.setStyleSheet("color:#ff9800;")
         btn_layout.addWidget(self.hint_label)
         btn_layout.addStretch()
-        self.switch_btn = PrimaryPushButton(FIF.UPDATE, "切换版本")
+        # 两个按钮均分剩余宽度，铺满整行
+        self.switch_btn = PushButton(FIF.UPDATE, "切换版本")
         apply_tooltip(self.switch_btn, "硬重置到选中的提交（丢弃未提交更改）")
         self.switch_btn.clicked.connect(self.switch_to_version)
-        btn_layout.addWidget(self.switch_btn)
+        btn_layout.addWidget(self.switch_btn, 1)
+        self.close_btn = PushButton(FIF.CLOSE, "关闭窗口")
+        apply_tooltip(self.close_btn, "关闭版本历史窗口")
+        self.close_btn.clicked.connect(self._page.reject)
+        btn_layout.addWidget(self.close_btn, 1)
         layout.addLayout(btn_layout)
 
     def set_loading(self):
@@ -274,15 +282,12 @@ class HistoryWorker(QObject):
         return commits
 
 
-class HistoryWindow(DarkDialog):
-    """版本历史独立弹出窗口（QDialog 体系暗色无边框），内含 SegmentedWidget 本地/远端导航。"""
+class HistoryWindow(MaskFadeGuardMixin, MessageBoxBase):
+    """版本历史弹出窗口（Fluent 遮罩弹窗），内含 SegmentedWidget 本地/远端导航。"""
 
     def __init__(self, manager, parent=None):
         super().__init__(parent)
-        # 独立顶层窗口，图标 + 标题由 DarkDialog 统一提供
-        self.setWindowTitle("版本历史")
-        self.setWindowIcon(QIcon(":/icon.ico"))
-        self.resize(980, 680)
+        self.widget.setFixedWidth(960)
 
         self._manager = manager
         self.repo_path = ""
@@ -291,13 +296,9 @@ class HistoryWindow(DarkDialog):
         self._load_generation = 0
         self._load_threads: list[tuple[QThread, HistoryWorker]] = []
 
-        layout = QVBoxLayout(self)
-        layout.setSpacing(12)
-        # 顶部下移 48px 避开标题栏
-        layout.setContentsMargins(16, 60, 16, 16)
-
-        self.repo_label = StrongBodyLabel("在仓库页点击「当前版本」列查看对应仓库历史")
-        layout.addWidget(self.repo_label)
+        # 遮罩弹窗无标题栏，标题显示在内容区顶部
+        self.title_label = StrongBodyLabel("版本历史")
+        self.viewLayout.addWidget(self.title_label)
 
         self.pivot = SegmentedWidget(self)
         self.stacked = QStackedWidget(self)
@@ -308,11 +309,14 @@ class HistoryWindow(DarkDialog):
         self._add_sub_interface(self.local_list, "local-history", "本地历史")
         self._add_sub_interface(self.remote_list, "remote-history", "远端历史")
 
-        layout.addWidget(self.pivot)
-        layout.addWidget(self.stacked, 1)
+        self.viewLayout.addWidget(self.pivot)
+        self.viewLayout.addWidget(self.stacked)
 
         self.stacked.setCurrentWidget(self.local_list)
         self.pivot.setCurrentItem("local-history")
+
+        # 底部按钮区整体隐藏：「切换版本」与「关闭」按钮在各列表底部同一行
+        self.buttonGroup.hide()
 
     def _add_sub_interface(self, widget: QWidget, key: str, text: str):
         widget.setObjectName(key)
@@ -332,8 +336,7 @@ class HistoryWindow(DarkDialog):
         """后台线程加载指定仓库的本地/远端历史，并计算两侧差异。"""
         self.repo_path = os.path.abspath(repo_path)
         name = os.path.basename(self.repo_path.rstrip("\\/"))
-        self.setWindowTitle(f"版本历史 · {name}")
-        self.repo_label.setText(f"版本历史 · {name}")
+        self.title_label.setText(f"版本历史 · {name}")
         logger.info(f"[历史] 加载 {self.repo_path}")
 
         # 代数计数：窗口复用时快速切换仓库，旧线程结果按代数丢弃
@@ -410,8 +413,20 @@ class HistoryWindow(DarkDialog):
         self.local_list.set_data(local_commits, local_only, local_info, local_hint)
         self.remote_list.set_data(remote_commits, remote_only, remote_info, remote_hint)
 
-    def closeEvent(self, event):
-        """关闭窗口时停止仍在运行的加载线程。"""
+    def done(self, code):
+        """关闭时停止仍在运行的加载线程。"""
+        self._stop_load_threads()
+        super().done(code)
+
+    def shutdown(self, timeout_ms: int = 3000):
+        """应用退出前停止并等待所有加载线程结束（避免 QThread 析构崩溃）。"""
+        threads = [t for t, _ in self._load_threads]
+        self._stop_load_threads()
+        for thread in threads:
+            thread.wait(timeout_ms)
+        self._load_threads.clear()
+
+    def _stop_load_threads(self):
         for thread, worker in list(self._load_threads):
             for sig in (worker.loaded, worker.failed):
                 try:
@@ -419,7 +434,6 @@ class HistoryWindow(DarkDialog):
                 except (RuntimeError, TypeError):
                     pass
             thread.quit()
-        super().closeEvent(event)
 
     def reset_to_commit(self, commit: str):
         """硬重置到指定提交后刷新历史。"""

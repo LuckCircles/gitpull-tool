@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 from urllib.parse import urlparse
 
-from github_url_utils import normalize_github_url
+from utils.github_url_utils import normalize_github_url
 
 
 class CloneManager:
