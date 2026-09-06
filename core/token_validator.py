@@ -5,6 +5,8 @@ import re
 import subprocess
 from typing import Tuple
 
+from utils.subprocess_utils import run_hidden
+
 # GitHub 令牌前缀（新版 PAT / OAuth / App 令牌）
 _GITHUB_PREFIXES = ("ghp_", "gho_", "ghu_", "ghs_", "ghr_")
 
@@ -59,6 +61,7 @@ def _curl_json(
     cmd = [
         "curl",
         "-s",
+        "-L",  # 跟随重定向（仓库改名/转移后 API 返回 301 → 新地址）
         "--connect-timeout",
         str(timeout),
         "--max-time",
@@ -72,7 +75,8 @@ def _curl_json(
         cmd.extend(["-x", proxy.strip()])
 
     try:
-        result = subprocess.run(
+        # run_hidden: Windows 下 CREATE_NO_WINDOW，避免打包后每次请求弹黑窗
+        result = run_hidden(
             cmd, capture_output=True, text=True, timeout=timeout + 7, encoding="utf-8"
         )
     except subprocess.TimeoutExpired:

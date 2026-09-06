@@ -5,6 +5,8 @@ import subprocess
 import urllib.parse
 from typing import Tuple
 
+from utils.subprocess_utils import run_hidden
+
 
 def validate_proxy_format(proxy: str) -> Tuple[bool, str]:
     """
@@ -72,7 +74,8 @@ def test_github_connectivity(
             cmd.extend(["-x", proxy])
 
         # 执行 curl 命令
-        result = subprocess.run(
+        # run_hidden: Windows 下 CREATE_NO_WINDOW，避免打包后每次请求弹黑窗
+        result = run_hidden(
             cmd, capture_output=True, text=True, timeout=timeout + 2
         )
 

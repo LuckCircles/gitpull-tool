@@ -57,6 +57,7 @@ from res_rc import qInitResources
 from ui.dialogs.branch_dialog import BranchDialog
 from ui.dialogs.clone_dialog import CloneRepoDialog
 from ui.dialogs.delete_dialog import DeleteRepoDialog
+from ui.dialogs.release_dialog import ReleaseDialog
 from ui.widgets.history_page import HistoryWindow
 from ui.dialogs.rename_dialog import RenameRepoDialog
 from ui.widgets.dark_window import InputDialog, apply_tooltip
@@ -168,6 +169,7 @@ class GitManager(MSFluentWindow):
         if self._history_window is not None:
             self._history_window.shutdown()
         BranchDialog.shutdown_active_workers()
+        ReleaseDialog.shutdown_active_workers()
         # 保存仓库缓存
         save_repo_cache(list(self._repo_cache.values()))
         logger.complete()  # 等待队列中的日志全部落盘
@@ -864,6 +866,14 @@ class GitManager(MSFluentWindow):
             open_remote.setEnabled(False)
         menu.addAction(open_remote)
 
+        # 查看 Release（仅 GitHub 远程可用）
+        view_release = Action(
+            FIF.CLOUD, "查看 Release", triggered=lambda: self.show_release_dialog(repo)
+        )
+        if not remote_url:
+            view_release.setEnabled(False)
+        menu.addAction(view_release)
+
         menu.addSeparator()
 
         # 忽略更新 / 恢复更新（动态显示）
@@ -1340,6 +1350,21 @@ class GitManager(MSFluentWindow):
             self._history_window = HistoryWindow(self, parent=self)
         self._history_window.load_repo(repo)
         self._history_window.show()
+
+    def show_release_dialog(self, repo: str):
+        """打开 Release 查看窗口（Fluent 遮罩弹窗）。"""
+        if not repo or repo == "...":
+            InfoBar.warning("提示", "请先扫描仓库", parent=self)
+            return
+        cache = self._repo_cache.get(repo, {})
+        remote_url = cache.get("remote_url", "")
+        if not remote_url:
+            InfoBar.warning("提示", "未获取到远程地址，请先扫描仓库", parent=self)
+            return
+
+        token = self.load_token()
+        proxy = self.load_proxy() if self.proxy_switch.isChecked() else None
+        ReleaseDialog(repo, remote_url, token, proxy, self).exec()
 
     def switch_to_commit(self, repo: str, commit: str, dialog=None):
         logger.warning(f"硬重置 {repo} → {commit}")

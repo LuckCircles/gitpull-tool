@@ -63,6 +63,9 @@ reword.py
 # Batch scripts
 *.bat
 
+# Runtime tools (deno embedded at build time, ~97MB binary)
+tools/deno.exe
+
 # Icons
 *.ico
 *.icon
