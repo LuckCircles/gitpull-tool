@@ -147,7 +147,11 @@ class UpdateService:
 
             # 失败善后：恢复 rebase 中间状态（autostash 会一并恢复）
             if code != 0 and self._abort_stale_rebase(repo_abs):
-                error = f"{error}\n（已自动恢复到更新前的状态）" if error else "已自动恢复到更新前的状态"
+                error = (
+                    f"{error}\n（已自动恢复到更新前的状态）"
+                    if error
+                    else "已自动恢复到更新前的状态"
+                )
 
         if code == 0:
             # 兜底：预检验被网络问题绕过、远端实际只剩说明文档 →
@@ -207,15 +211,11 @@ class UpdateService:
         - 远端分支最新提交仅剩说明文档或为空 → 疑似删库/归档，阻断
         - 其它 fetch 失败（网络抖动等）不阻断，交由 pull 的重试逻辑兜底
         """
-        url, _, _ = self._git_service.run_git(
-            repo_abs, ["remote", "get-url", "origin"]
-        )
+        url, _, _ = self._git_service.run_git(repo_abs, ["remote", "get-url", "origin"])
         if not url.strip():
             return "未配置 origin 远端，无法更新。"
 
-        branch, _, _ = self._git_service.run_git(
-            repo_abs, ["branch", "--show-current"]
-        )
+        branch, _, _ = self._git_service.run_git(repo_abs, ["branch", "--show-current"])
         branch = branch.strip()
         if not branch:
             return "当前处于游离 HEAD 状态，请先切换到分支后再更新。"
@@ -223,13 +223,12 @@ class UpdateService:
         # 先 fetch（--prune 清理已删除的远端跟踪分支），pull 内部的
         # fetch 随后为增量操作，几乎无额外开销
         output, error, code = self._git_service.run_git(
-            repo_abs, ["fetch", "--quiet", "--prune", "origin"],
+            repo_abs,
+            ["fetch", "--quiet", "--prune", "origin"],
             timeout=PULL_TIMEOUT,
         )
         if code != 0:
-            if self._is_remote_gone_error(error) or self._is_remote_gone_error(
-                output
-            ):
+            if self._is_remote_gone_error(error) or self._is_remote_gone_error(output):
                 return (
                     "远端仓库已删除或不可访问（404），无法更新。"
                     "若确认远端已删库，可删除本地仓库或设置忽略更新。"
@@ -262,9 +261,7 @@ class UpdateService:
                 "已阻止本次更新以保护本地代码。"
             )
         if self._is_archive_only(remote_files):
-            names = ", ".join(
-                os.path.basename(f) for f in remote_files
-            )
+            names = ", ".join(os.path.basename(f) for f in remote_files)
             return (
                 f"远端仓库疑似已删除或归档：远端分支仅剩说明文档（{names}），"
                 "已阻止本次更新以保护本地代码。若确认需要同步，请手动处理。"
@@ -276,9 +273,7 @@ class UpdateService:
         """文件清单是否仅由删库/归档说明文档构成（1~3 个文件）。"""
         if not (1 <= len(files) <= 3):
             return False
-        stems = {
-            os.path.splitext(os.path.basename(f))[0].lower() for f in files
-        }
+        stems = {os.path.splitext(os.path.basename(f))[0].lower() for f in files}
         return stems <= cls._ARCHIVE_DOC_STEMS
 
     @classmethod
@@ -336,9 +331,7 @@ class UpdateService:
             return output, error, code
 
         # lock 冲突（多为外部 git 进程瞬时占用或上次残留）→ 清理后重试
-        logger.info(
-            f"[更新] {os.path.basename(repo_abs)}: 遇到 lock 冲突，清理后重试"
-        )
+        logger.info(f"[更新] {os.path.basename(repo_abs)}: 遇到 lock 冲突，清理后重试")
         self._clear_locks(repo_abs)
         return self._git_service.run_git(repo_abs, args, timeout=PULL_TIMEOUT)
 
@@ -426,7 +419,9 @@ class UpdateService:
         返回是否执行了恢复。
         """
         git_dir = os.path.join(repo_abs, ".git")
-        paths = [os.path.join(git_dir, name) for name in ("rebase-merge", "rebase-apply")]
+        paths = [
+            os.path.join(git_dir, name) for name in ("rebase-merge", "rebase-apply")
+        ]
         if not any(os.path.exists(p) for p in paths):
             return False
 
@@ -485,9 +480,7 @@ class UpdateService:
         return ""
 
     def _current_head(self, repo_abs: str) -> str:
-        out, _, code = self._git_service.run_git(
-            repo_abs, ["rev-parse", "HEAD"]
-        )
+        out, _, code = self._git_service.run_git(repo_abs, ["rev-parse", "HEAD"])
         return out.strip() if code == 0 else ""
 
     # ------------------------------------------------------------------

@@ -1,13 +1,13 @@
-"""分支管理对话框 — Fluent 遮罩弹窗 + 分支列表后台线程加载。
+"""分支管理对话框 — Fluent 遮罩弹窗 + 分支列表线程池加载。
 
 fetch 是网络操作（超时 30s），在主线程执行会冻结整个窗口，
-因此加载流程放入 QThread，通过 Signal/Slot 回传结果。
+因此加载流程经 TaskExecutor 提交到全局线程池，通过 Signal 回传结果。
 """
 
 import os
 
 from loguru import logger
-from PySide6.QtCore import QObject, Qt, QThread, Signal
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QHeaderView,
@@ -24,96 +24,82 @@ from qfluentwidgets import (
 
 from core.git_runner import GitRunner
 from ui.widgets.dark_window import ConfirmDialog, MaskFadeGuardMixin, apply_tooltip
+from utils.qt_executor import QFuture, TaskExecutor
 
 
-class BranchWorker(QObject):
-    """后台加载分支列表：fetch（网络）+ for-each-ref（本地）解析为行数据。"""
+def _run_git(repo: str, args: list[str], timeout: int):
+    return GitRunner.run_simple(
+        args,
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        encoding="utf-8",
+        errors="replace",
+    )
 
-    loaded = Signal(list)  # list[dict]
-    failed = Signal(str)
 
-    def __init__(self, repo_path: str):
-        super().__init__()
-        self._repo = repo_path
+def collect_branches(repo_path: str) -> list[dict]:
+    """后台加载分支列表：fetch（网络）+ for-each-ref（本地）解析为行数据。
 
-    def run(self):
+    线程安全：只执行 git 命令并返回数据，不触碰任何 Qt 控件。
+    """
+    _run_git(repo_path, ["git", "fetch", "--quiet"], timeout=30)
+
+    current = ""
+    r = _run_git(repo_path, ["git", "branch", "--show-current"], timeout=15)
+    if r.returncode == 0:
+        current = r.stdout.strip()
+
+    result = _run_git(
+        repo_path,
+        [
+            "git",
+            "for-each-ref",
+            "--format=%(refname)|%(refname:short)|%(objectname:short)|%(committerdate:format:%Y-%m-%d %H:%M)|%(subject)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+        timeout=15,
+    )
+    if result.returncode != 0:
+        return []
+
+    rows: list[dict] = []
+    for line in result.stdout.strip().split("\n"):
+        if not line.strip():
+            continue
         try:
-            self.loaded.emit(self._collect())
-        except Exception as e:  # noqa: BLE001 后台线程兜底，错误经信号回传
-            self.failed.emit(str(e))
+            refname, short_name, commit, date, message = line.split("|", 4)
+        except ValueError:
+            continue
+        if refname.startswith("refs/remotes/") and refname.endswith("/HEAD"):
+            continue
 
-    def _collect(self) -> list[dict]:
-        self._run(["git", "fetch", "--quiet"], timeout=30)
-
-        current = ""
-        r = self._run(["git", "branch", "--show-current"], timeout=15)
-        if r.returncode == 0:
-            current = r.stdout.strip()
-
-        result = self._run(
-            [
-                "git",
-                "for-each-ref",
-                "--format=%(refname)|%(refname:short)|%(objectname:short)|%(committerdate:format:%Y-%m-%d %H:%M)|%(subject)",
-                "refs/heads",
-                "refs/remotes",
-            ],
-            timeout=15,
+        is_remote = refname.startswith("refs/remotes/")
+        rows.append(
+            {
+                "name": short_name,
+                "refname": refname,
+                "is_remote": is_remote,
+                "is_current": not is_remote and short_name == current,
+                "commit": commit,
+                "date": date,
+                "message": message,
+            }
         )
-        if result.returncode != 0:
-            return []
-
-        rows: list[dict] = []
-        for line in result.stdout.strip().split("\n"):
-            if not line.strip():
-                continue
-            try:
-                refname, short_name, commit, date, message = line.split("|", 4)
-            except ValueError:
-                continue
-            if refname.startswith("refs/remotes/") and refname.endswith("/HEAD"):
-                continue
-
-            is_remote = refname.startswith("refs/remotes/")
-            rows.append(
-                {
-                    "name": short_name,
-                    "refname": refname,
-                    "is_remote": is_remote,
-                    "is_current": not is_remote and short_name == current,
-                    "commit": commit,
-                    "date": date,
-                    "message": message,
-                }
-            )
-        return rows
-
-    def _run(self, args: list[str], timeout: int):
-        return GitRunner.run_simple(
-            args,
-            cwd=self._repo,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            encoding="utf-8",
-            errors="replace",
-        )
+    return rows
 
 
 class BranchDialog(MaskFadeGuardMixin, MessageBoxBase):
-    """分支管理对话框（Fluent 遮罩弹窗，分支列表后台线程加载，UI 不冻结）"""
-
-    # 类级引用：对话框销毁后仍在执行的加载线程不被 GC
-    #（对话框在 main.py 中以临时对象方式创建，exec 返回即被回收）
-    _active_workers: set = set()
+    """分支管理对话框（Fluent 遮罩弹窗，分支列表线程池加载，UI 不冻结）"""
 
     def __init__(self, repo_path: str, parent=None):
         super().__init__(parent)
         self.repo_path = repo_path
         repo_name = os.path.basename(repo_path.rstrip("\\/"))
 
-        self._thread: QThread | None = None
-        self._worker: BranchWorker | None = None
+        self._load_future: QFuture | None = None
 
         self.widget.setFixedWidth(880)
 
@@ -150,7 +136,7 @@ class BranchDialog(MaskFadeGuardMixin, MessageBoxBase):
         self.viewLayout.addWidget(self.table)
 
         # 底部按钮：「切换分支」「关闭窗口」均为普通按钮
-        #（隐藏自带的主色 yesButton，在按钮区左侧插入普通按钮，等宽分布）
+        # （隐藏自带的主色 yesButton，在按钮区左侧插入普通按钮，等宽分布）
         self.yesButton.hide()
         self.switch_btn = PushButton("切换分支")
         apply_tooltip(self.switch_btn, "切换到选中的分支")
@@ -167,22 +153,16 @@ class BranchDialog(MaskFadeGuardMixin, MessageBoxBase):
     # 后台加载
     # ------------------------------------------------------------------
     def load_branches(self):
-        """后台线程加载分支列表（fetch 网络操作不阻塞 UI）。"""
+        """线程池加载分支列表（fetch 网络操作不阻塞 UI）。"""
         self._set_loading(True)
 
-        self._worker = BranchWorker(self.repo_path)
-        self._thread = QThread()
-        self._worker.moveToThread(self._thread)
-        self._thread.started.connect(self._worker.run)
-        self._worker.loaded.connect(self._on_branches_loaded)
-        self._worker.failed.connect(self._on_branches_failed)
-
-        key = (self._thread, self._worker)
-        BranchDialog._active_workers.add(key)
-        self._thread.finished.connect(
-            lambda: BranchDialog._active_workers.discard(key)
+        self._load_future = (
+            TaskExecutor.run(collect_branches, self.repo_path)
+            .then(
+                on_success=self._on_branches_loaded,
+                on_failed=self._on_branches_failed,
+            )
         )
-        self._thread.start()
 
     def _set_loading(self, loading: bool):
         self.switch_btn.setEnabled(not loading)
@@ -238,33 +218,11 @@ class BranchDialog(MaskFadeGuardMixin, MessageBoxBase):
                         item.setFont(font)
 
     def done(self, code):
-        """关闭时停止仍在执行的加载线程（引用由 _active_workers 持有直至结束）。"""
-        self._stop_loading_thread()
+        """关闭时丢弃仍在执行的加载任务结果（future 由 TaskExecutor 保活至结束）。"""
+        if self._load_future is not None:
+            self._load_future.detach()
+            self._load_future = None
         super().done(code)
-
-    @classmethod
-    def shutdown_active_workers(cls, timeout_ms: int = 3000):
-        """应用退出前停止并等待所有仍在运行的加载线程（避免 QThread 析构崩溃）。"""
-        for thread, worker in list(cls._active_workers):
-            for sig in (worker.loaded, worker.failed):
-                try:
-                    sig.disconnect()
-                except (RuntimeError, TypeError):
-                    pass
-            thread.quit()
-            thread.wait(timeout_ms)
-
-    def _stop_loading_thread(self):
-        thread, worker = self._thread, self._worker
-        self._thread = self._worker = None
-        if thread:
-            if worker:
-                for sig in (worker.loaded, worker.failed):
-                    try:
-                        sig.disconnect()
-                    except (RuntimeError, TypeError):
-                        pass
-            thread.quit()
 
     # ------------------------------------------------------------------
     # 分支切换

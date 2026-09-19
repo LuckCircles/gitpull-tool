@@ -5,10 +5,16 @@ import subprocess
 import sys
 import threading
 import webbrowser
-from concurrent.futures import ThreadPoolExecutor
 
 from loguru import logger
-from PySide6.QtCore import QObject, Qt, QThread, QtMsgType, Signal, qInstallMessageHandler
+from PySide6.QtCore import (
+    QObject,
+    Qt,
+    QThread,
+    QtMsgType,
+    Signal,
+    qInstallMessageHandler,
+)
 from PySide6.QtGui import QColor, QIcon, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
@@ -20,6 +26,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
 # 提前加载 qfluentwidgets 配置模块，屏蔽其推广信息（print 到 stdout）
 with contextlib.redirect_stdout(io.StringIO()):
     import qfluentwidgets.common.config  # noqa: F401
@@ -50,8 +57,10 @@ from qfluentwidgets import (
 
 from app.config import load_config, save_config, save_repo_cache
 from core.git_service import GitService
+from core.proxy_validator import verify_proxy
 from core.repo_service import RepoService
 from core.scan_service import ScanService
+from core.token_validator import verify_token
 from core.update_service import UpdateService
 from res_rc import qInitResources
 from ui.dialogs.branch_dialog import BranchDialog
@@ -61,8 +70,7 @@ from ui.dialogs.release_dialog import ReleaseDialog
 from ui.widgets.history_page import HistoryWindow
 from ui.dialogs.rename_dialog import RenameRepoDialog
 from ui.widgets.dark_window import InputDialog, apply_tooltip
-from workers.proxy_verify_worker import ProxyVerifyWorker
-from workers.token_verify_worker import TokenVerifyWorker
+from utils.qt_executor import QFuture, TaskExecutor
 
 
 class QtLogHandler(QObject):
@@ -128,15 +136,16 @@ class GitManager(MSFluentWindow):
         self.base_dir = self.load_base_dir()
         self.repos: list[str] = []
         self._repo_cache: dict[str, dict] = {}  # path -> cached info
-        self.executor = ThreadPoolExecutor(max_workers=6)
+        # 全局线程池承载所有后台任务（扫描/更新/验证），IO 密集场景调高并发
+        TaskExecutor.setMaxThreads(max(8, QThread.idealThreadCount()))
         self._scan_lock = threading.Lock()
         self._scan_generation = 0
         self._scan_expected = 0
         self._scan_done = 0
         self._scan_need_update = 0
         self._scan_ignored = 0
-        self._proxy_verify_thread = None  # 代理验证线程
-        self._token_verify_thread = None  # 令牌验证线程
+        self._proxy_verify_future: QFuture | None = None  # 运行中的代理验证任务
+        self._token_verify_future: QFuture | None = None  # 运行中的令牌验证任务
         self._history_window: HistoryWindow | None = None  # 版本历史弹出窗口（复用）
 
         self.init_ui()
@@ -158,18 +167,9 @@ class GitManager(MSFluentWindow):
         save_config(self._config_cache)
 
     def closeEvent(self, event):
-        self.executor.shutdown(wait=False, cancel_futures=True)
         self.git_service.shutdown()
-        # 等待验证线程结束，避免退出时 QThread 被析构导致崩溃
-        for thread in (self._proxy_verify_thread, self._token_verify_thread):
-            if thread is not None and thread.isRunning():
-                thread.quit()
-                thread.wait()
-        # 等待弹窗后台线程结束，避免退出时 QThread 被析构导致崩溃
-        if self._history_window is not None:
-            self._history_window.shutdown()
-        BranchDialog.shutdown_active_workers()
-        ReleaseDialog.shutdown_active_workers()
+        # 等待线程池任务结束（超时兜底，避免退出时任务访问已销毁对象）
+        TaskExecutor.waitForDone(5000)
         # 保存仓库缓存
         save_repo_cache(list(self._repo_cache.values()))
         logger.complete()  # 等待队列中的日志全部落盘
@@ -204,6 +204,10 @@ class GitManager(MSFluentWindow):
     def load_token(self) -> str:
         config = self._config_cache
         return str(config.get("token") or "").strip()
+
+    def load_release_dir(self) -> str:
+        """Release 资产下载目录（空串表示未设置，保存到仓库所在目录）。"""
+        return str(self._config_cache.get("release_dir") or "").strip()
 
     # ====================== 忽略更新管理 ======================
     def _get_ignore_list(self) -> list[str]:
@@ -356,6 +360,17 @@ class GitManager(MSFluentWindow):
         self.dir_card.setContent(self.base_dir)
         self.dir_card.clicked.connect(self.select_settings_dir)
         self.dir_group.addSettingCard(self.dir_card)
+
+        self.release_dir_card = PushSettingCard(
+            "选择目录",
+            FIF.DOWNLOAD,
+            "Release 下载目录",
+            "下载 Release 资产的默认保存位置，未设置时保存到仓库所在目录",
+            self.dir_group,
+        )
+        self.release_dir_card.setContent(self.load_release_dir() or "未设置")
+        self.release_dir_card.clicked.connect(self.select_release_dir)
+        self.dir_group.addSettingCard(self.release_dir_card)
         settings_layout.addWidget(self.dir_group)
 
         # ========== 网络设置 ==========
@@ -516,6 +531,16 @@ class GitManager(MSFluentWindow):
             self._save_cached_config()
             logger.success(f"仓库存放目录已更新: {path}")
 
+    def select_release_dir(self):
+        start = self.load_release_dir() or self.base_dir
+        path = QFileDialog.getExistingDirectory(self, "选择目录", start)
+        if path:
+            # 选择即保存并应用
+            self._config_cache["release_dir"] = path
+            self._save_cached_config()
+            self.release_dir_card.setContent(path)
+            logger.success(f"Release 下载目录已更新: {path}")
+
     def _edit_proxy(self):
         dialog = InputDialog(
             "编辑代理地址",
@@ -620,7 +645,7 @@ class GitManager(MSFluentWindow):
             return
 
         for repo in self.repos:
-            self.executor.submit(self.load_repo_info, repo, generation)
+            TaskExecutor.run(self.load_repo_info, repo, generation)
 
     def _mark_scan_progress(
         self, generation: int, need_update: bool, ignored: bool = False
@@ -742,8 +767,8 @@ class GitManager(MSFluentWindow):
         self._add_update_button(row, repo_path)
         # 撤销搜索过滤确保新行可见
         self.search_edit.clear()
-        # 加载仓库信息
-        self.executor.submit(self.load_repo_info, repo_path, None)
+        # 加载仓库信息：刚克隆完成 → 远端引用即最新，单次本地读取直达最终状态
+        TaskExecutor.run(self.load_repo_info, repo_path, None, True)
 
     def update_single_repo(self, repo_path: str):
         """通过repo_path更新单个仓库。自动查找当前行号"""
@@ -752,7 +777,7 @@ class GitManager(MSFluentWindow):
         if row == -1:
             logger.warning(f"未找到仓库行: {repo_path}")
             return
-        self.executor.submit(self.pull_repo, repo_path)
+        TaskExecutor.run(self.pull_repo, repo_path)
 
     def get_checked_repos(self) -> list[tuple[int, str]]:
         checked: list[tuple[int, str]] = []
@@ -802,7 +827,7 @@ class GitManager(MSFluentWindow):
     def _start_updates(self, to_update: list[str], skipped: int):
         """提交一批仓库到更新线程池并提示。"""
         for repo in to_update:
-            self.executor.submit(self.pull_repo, repo)
+            TaskExecutor.run(self.pull_repo, repo)
         logger.info(f"[批量更新] 已提交 {len(to_update)} 个仓库")
         InfoBar.success(
             "已开始",
@@ -933,7 +958,7 @@ class GitManager(MSFluentWindow):
                 parent=self,
             )
         # 立即刷新当前仓库状态（自动查找行号）
-        self.executor.submit(self.load_repo_info, repo_path, None)
+        TaskExecutor.run(self.load_repo_info, repo_path, None)
 
     def _open_local_folder(self, repo: str):
         path = os.path.abspath(repo)
@@ -1072,38 +1097,25 @@ class GitManager(MSFluentWindow):
             InfoBar.error("失败", str(e)[:150], parent=self)
 
     def verify_proxy_settings(self):
-        """验证代理设置和GitHub连接性"""
-        # 上一次验证仍在进行 → 忽略重复点击，避免线程引用错乱
-        if self._proxy_verify_thread and self._proxy_verify_thread.isRunning():
+        """验证代理设置和GitHub连接性（线程池执行，不阻塞 UI）"""
+        # 上一次验证仍在进行 → 忽略重复点击
+        if self._proxy_verify_future and not self._proxy_verify_future.isFinished():
             InfoBar.info("提示", "正在验证中，请稍候...", parent=self)
             return
 
         proxy = self.load_proxy()
-
-        # 显示验证开始
         InfoBar.info("验证中...", "正在验证代理配置和连接性，请稍候...", parent=self)
 
-        # 创建工作线程
-        self._proxy_verify_worker = ProxyVerifyWorker(proxy, timeout=10)
-        self._proxy_verify_thread = QThread()
-        self._proxy_verify_worker.moveToThread(self._proxy_verify_thread)
-
-        # 连接信号
-        self._proxy_verify_worker.finished.connect(self._on_proxy_verify_finished)
-        self._proxy_verify_thread.started.connect(self._proxy_verify_worker.run)
-
-        # 启动线程
-        self._proxy_verify_thread.start()
+        self._proxy_verify_future = TaskExecutor.run(
+            verify_proxy, proxy, 10
+        ).then(
+            on_success=lambda result: self._on_proxy_verify_finished(*result),
+            on_failed=lambda message: self._on_proxy_verify_finished(False, message),
+        )
 
     def _on_proxy_verify_finished(self, success: bool, message: str):
-        """代理验证完成回调"""
-        # 清理线程
-        if self._proxy_verify_thread:
-            self._proxy_verify_thread.quit()
-            self._proxy_verify_thread.wait()
-            self._proxy_verify_thread = None
-
-        # 显示结果
+        """代理验证完成回调（主线程）"""
+        self._proxy_verify_future = None
         if success:
             InfoBar.success("验证成功", message, parent=self)
             logger.success(f"代理验证通过: {message}")
@@ -1112,9 +1124,9 @@ class GitManager(MSFluentWindow):
             logger.error(f"代理验证失败: {message}")
 
     def verify_token_settings(self):
-        """验证访问令牌可用性"""
-        # 上一次验证仍在进行 → 忽略重复点击，避免线程引用错乱
-        if self._token_verify_thread and self._token_verify_thread.isRunning():
+        """验证访问令牌可用性（线程池执行，不阻塞 UI）"""
+        # 上一次验证仍在进行 → 忽略重复点击
+        if self._token_verify_future and not self._token_verify_future.isFinished():
             InfoBar.info("提示", "正在验证中，请稍候...", parent=self)
             return
 
@@ -1123,31 +1135,20 @@ class GitManager(MSFluentWindow):
             InfoBar.warning("提示", "未设置令牌，请先编辑访问令牌", parent=self)
             return
 
-        # 显示验证开始
         InfoBar.info("验证中...", "正在验证令牌可用性，请稍候...", parent=self)
 
-        # 创建工作线程（启用代理时携带代理地址）
+        # 启用代理时携带代理地址
         proxy = self.load_proxy() if self.proxy_switch.isChecked() else None
-        self._token_verify_worker = TokenVerifyWorker(token, proxy, timeout=10)
-        self._token_verify_thread = QThread()
-        self._token_verify_worker.moveToThread(self._token_verify_thread)
-
-        # 连接信号
-        self._token_verify_worker.finished.connect(self._on_token_verify_finished)
-        self._token_verify_thread.started.connect(self._token_verify_worker.run)
-
-        # 启动线程
-        self._token_verify_thread.start()
+        self._token_verify_future = TaskExecutor.run(
+            verify_token, token, proxy, 10
+        ).then(
+            on_success=lambda result: self._on_token_verify_finished(*result),
+            on_failed=lambda message: self._on_token_verify_finished(False, message),
+        )
 
     def _on_token_verify_finished(self, success: bool, message: str):
-        """令牌验证完成回调"""
-        # 清理线程
-        if self._token_verify_thread:
-            self._token_verify_thread.quit()
-            self._token_verify_thread.wait()
-            self._token_verify_thread = None
-
-        # 显示结果
+        """令牌验证完成回调（主线程）"""
+        self._token_verify_future = None
         if success:
             InfoBar.success("验证成功", message, parent=self)
             logger.success(f"令牌验证通过: {message}")
@@ -1156,18 +1157,42 @@ class GitManager(MSFluentWindow):
             logger.error(f"令牌验证失败: {message}")
 
     # ====================== 数据加载与按钮状态控制 ======================
-    def load_repo_info(self, repo_path: str, generation: int | None = None):
+    def load_repo_info(
+        self, repo_path: str, generation: int | None = None, assume_fresh: bool = False
+    ):
         """加载仓库信息（线程安全：可在工作线程调用）——阶段1：本地信息先行。
 
         只做本地 git 读取（分支/版本/远端地址，毫秒级、无网络），立即回传，
         状态列显示 "⏳ 同步中"。阶段2（fetch 远端）作为独立任务提交，
         避免慢速 fetch 阻塞其他仓库的阶段1 展示。
         行号由 update_table_row 在主线程内根据 repo_path 查找。
+
+        assume_fresh=True（刚克隆完成）：远端引用与克隆时一致，跳过两阶段
+        与 fetch，单次本地读取直接得到最终状态，新行即时刷新到位。
         """
         repo_path = os.path.abspath(repo_path)
 
         try:
             ignored = self.is_repo_ignored(repo_path)
+            if assume_fresh:
+                status = self.git_service.inspect_repository(
+                    repo_path, ignored=ignored, assume_fresh=True
+                )
+                self.update_row_signal.emit(
+                    repo_path,
+                    status.branch,
+                    status.local_commit,
+                    status.remote_commit,
+                    status.status,
+                    status.ahead_behind,
+                    status.remote_url,
+                )
+                if generation is not None:
+                    self._mark_scan_progress(
+                        generation, status.need_update, status.ignored
+                    )
+                return
+
             local = self.git_service.inspect_repository(
                 repo_path, ignored=ignored, fetch=False
             )
@@ -1187,7 +1212,7 @@ class GitManager(MSFluentWindow):
                     self._mark_scan_progress(generation, False, True)
             else:
                 # 阶段2 独立提交：所有仓库的阶段1 先行完成，fetch 再排队
-                self.executor.submit(self._sync_repo_info, repo_path, generation)
+                TaskExecutor.run(self._sync_repo_info, repo_path, generation)
         except Exception as e:
             logger.error(f"加载失败 {repo_path}: {str(e)}")
             self.update_row_signal.emit(
@@ -1257,7 +1282,6 @@ class GitManager(MSFluentWindow):
         repo_name = os.path.basename(repo.rstrip("\\/")) or repo
         repo_item = QTableWidgetItem(repo_name)
         repo_item.setData(Qt.UserRole, repo)
-        repo_item.setToolTip(repo)
         self.table.setItem(row, 1, repo_item)
 
         status_text = (
@@ -1285,7 +1309,7 @@ class GitManager(MSFluentWindow):
         btn = self.table.cellWidget(row, 6)
         if btn:
             btn.setEnabled(is_updatable)
-                
+
         # 更新缓存
         self._repo_cache[repo] = {
             "name": repo_name,
@@ -1313,9 +1337,7 @@ class GitManager(MSFluentWindow):
 
         if result.success:
             logger.success(f"{repo} 更新成功")
-            self.update_complete_signal.emit(
-                result.repo_name, True, result.message
-            )
+            self.update_complete_signal.emit(result.repo_name, True, result.message)
             if result.file_warning:
                 logger.warning(
                     f"[完整性检查] {result.repo_name}: {result.file_warning}"
@@ -1364,7 +1386,10 @@ class GitManager(MSFluentWindow):
 
         token = self.load_token()
         proxy = self.load_proxy() if self.proxy_switch.isChecked() else None
-        ReleaseDialog(repo, remote_url, token, proxy, self).exec()
+        ReleaseDialog(
+            repo, remote_url, token, proxy, self,
+            download_dir=self.load_release_dir(),
+        ).exec()
 
     def switch_to_commit(self, repo: str, commit: str, dialog=None):
         logger.warning(f"硬重置 {repo} → {commit}")

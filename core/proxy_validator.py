@@ -75,9 +75,7 @@ def test_github_connectivity(
 
         # 执行 curl 命令
         # run_hidden: Windows 下 CREATE_NO_WINDOW，避免打包后每次请求弹黑窗
-        result = run_hidden(
-            cmd, capture_output=True, text=True, timeout=timeout + 2
-        )
+        result = run_hidden(cmd, capture_output=True, text=True, timeout=timeout + 2)
 
         # 检查响应
         if result.returncode == 0:

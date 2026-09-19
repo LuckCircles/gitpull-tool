@@ -20,7 +20,7 @@ def compile_with_nuitka():
         "--follow-imports",
         "--remove-output",
         f"--output-dir={OUTPUT_DIR}",
-        #"--mingw64",
+        # "--mingw64",
         "--msvc=latest",
         "--jobs=8",
         # "--disable-ccache",
@@ -32,7 +32,7 @@ def compile_with_nuitka():
         "--windows-icon-from-ico=icon.ico",
         "--onefile",
         # 单文件缓存解压目录：首次启动解压一次，后续启动复用
-        #（否则每次启动都重新解压内嵌的 deno.exe，约 97MB）
+        # （否则每次启动都重新解压内嵌的 deno.exe，约 97MB）
         "--onefile-tempdir-spec={CACHE_DIR}/GitPull-tool",
         # 内嵌 tools/（deno + 下载脚本）：exe 单文件即可分发，
         # 运行时经 __compiled__.containing_dir/tools 定位（见 workers/release_worker.py）

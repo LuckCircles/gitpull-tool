@@ -127,12 +127,17 @@ class GitRunner:
         started: float,
         stderr: str | None,
     ):
-        """记录一次命令执行的调试日志（命令、目录、返回码、耗时）。"""
+        """失败命令的调试日志（返回码、目录、耗时、stderr 摘录）。
+
+        成功命令（rc=0）不记录，避免逐命令刷屏；仅失败时输出。
+        """
+        if returncode in (0, None):
+            return
         elapsed = time.perf_counter() - started
         text = " ".join(str(c) for c in cmd)
         where = f" @ {cwd}" if cwd else ""
         logger.debug(f"[cmd] rc={returncode} {elapsed:.2f}s{where}: {text}")
-        if returncode not in (0, None) and stderr:
+        if stderr:
             snippet = str(stderr).strip().replace("\n", " | ")[:_STDERR_SNIPPET]
             if snippet:
                 logger.debug(f"[cmd] stderr: {snippet}")

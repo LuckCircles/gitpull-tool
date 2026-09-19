@@ -19,3 +19,19 @@ with contextlib.redirect_stdout(io.StringIO()):
 
 
 优化算法逻辑，避免产生lock file，产生pull问题。
+
+
+
+参考仓库存放目录的组件和布局，新增一个设置release下载目录
+
+每次启动只清理并重新生成log日志文件，repo和软件设置的json文件并不清理。
+
+https://github.com/AresConnor/pyqt5-concurrent优化线程处理
+
+取消仓库列名称的tooltip显示，初始时和扫描完成后都不显示。
+
+优化release面板进度条，扫描和下载统一为一个。使用listwidget显示，左侧是list，右侧是根据list显示的区域，并且release信息也显示，增加停止和取消以及取消后未下载完文件的清理。
+
+克隆列表后及时部分刷新，刷新增加后的部分，不全量刷新。
+
+添加git镜像，

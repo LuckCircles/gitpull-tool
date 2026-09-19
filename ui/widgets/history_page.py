@@ -8,8 +8,8 @@
             ├── _CommitList(remote=False)  → git log HEAD
             └── _CommitList(remote=True)   → git log origin/<当前分支>
 
-加载流程（后台线程）：
-    git 命令序列在 HistoryWorker（QThread）中执行，经 Signal 回传；
+加载流程（线程池）：
+    git 命令序列经 TaskExecutor 提交到全局线程池，结果经 Signal 回传；
     快速切换仓库时按代数（generation）丢弃过期结果。
 
 本地/远端区分：
@@ -21,7 +21,7 @@
 import os
 
 from loguru import logger
-from PySide6.QtCore import QObject, Qt, QThread, Signal
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -44,6 +44,7 @@ from qfluentwidgets import (
 
 from core.git_runner import GitRunner
 from ui.widgets.dark_window import ConfirmDialog, MaskFadeGuardMixin, apply_tooltip
+from utils.qt_executor import QFuture, TaskExecutor
 
 LOG_LIMIT = 50
 
@@ -180,106 +181,81 @@ class _CommitList(QWidget):
             self._page.reset_to_commit(commit)
 
 
-class HistoryWorker(QObject):
+def _git(repo: str, args: list[str], timeout: int):
+    return GitRunner.run_simple(
+        args,
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def collect_history(repo_path: str) -> dict:
     """后台加载版本历史：当前分支 + 本地/远端提交列表。
 
-    git 命令序列在 QThread 中执行（大仓库可能较慢），
-    结果经 Signal 回传主线程。
+    git 命令序列经 TaskExecutor 在线程池中执行（大仓库可能较慢），
+    线程安全：只执行 git 命令并返回数据，不触碰任何 Qt 控件。
     """
+    branch_result = _git(repo_path, ["git", "branch", "--show-current"], timeout=15)
+    branch = branch_result.stdout.strip() if branch_result.returncode == 0 else ""
+    local_commits = _git_log(repo_path, ["HEAD"])
 
-    loaded = Signal(dict)  # branch, local_commits, remote_exists, remote_commits
-    failed = Signal(str)
-
-    def __init__(self, repo_path: str):
-        super().__init__()
-        self._repo = repo_path
-
-    def run(self):
-        try:
-            self.loaded.emit(self._collect())
-        except Exception as e:  # noqa: BLE001 后台线程兜底，错误经信号回传
-            self.failed.emit(str(e))
-
-    def _collect(self) -> dict:
-        branch = self._current_branch()
-        local_commits = self._log(["HEAD"])
-
-        remote_ref = f"origin/{branch}" if branch else ""
-        remote_exists = False
-        remote_commits: list[dict] = []
-        if remote_ref:
-            check = GitRunner.run_simple(
-                ["git", "rev-parse", "--verify", "--quiet", remote_ref],
-                cwd=self._repo,
-                capture_output=True,
-                text=True,
-                timeout=15,
-                encoding="utf-8",
-                errors="replace",
-            )
-            remote_exists = check.returncode == 0
-            if remote_exists:
-                remote_commits = self._log([remote_ref])
-        return {
-            "branch": branch,
-            "local_commits": local_commits,
-            "remote_exists": remote_exists,
-            "remote_commits": remote_commits,
-        }
-
-    def _current_branch(self) -> str:
-        result = GitRunner.run_simple(
-            ["git", "branch", "--show-current"],
-            cwd=self._repo,
-            capture_output=True,
-            text=True,
+    remote_ref = f"origin/{branch}" if branch else ""
+    remote_exists = False
+    remote_commits: list[dict] = []
+    if remote_ref:
+        check = _git(
+            repo_path,
+            ["git", "rev-parse", "--verify", "--quiet", remote_ref],
             timeout=15,
-            encoding="utf-8",
-            errors="replace",
         )
-        return result.stdout.strip() if result.returncode == 0 else ""
+        remote_exists = check.returncode == 0
+        if remote_exists:
+            remote_commits = _git_log(repo_path, [remote_ref])
+    return {
+        "branch": branch,
+        "local_commits": local_commits,
+        "remote_exists": remote_exists,
+        "remote_commits": remote_commits,
+    }
 
-    def _log(self, target: list[str]) -> list[dict]:
-        """执行 git log 并解析为提交列表。"""
-        cmd = [
-            "git",
-            "log",
-            *target,
-            "--pretty=format:%H|%ad|%an|%s",
-            "--date=format:%Y-%m-%d %H:%M",
-            f"-{LOG_LIMIT}",
-        ]
-        result = GitRunner.run_simple(
-            cmd,
-            cwd=self._repo,
-            capture_output=True,
-            text=True,
-            timeout=20,
-            encoding="utf-8",
-            errors="replace",
-        )
 
-        commits: list[dict] = []
-        if result.returncode != 0:
-            return commits
+def _git_log(repo_path: str, target: list[str]) -> list[dict]:
+    """执行 git log 并解析为提交列表。"""
+    cmd = [
+        "git",
+        "log",
+        *target,
+        "--pretty=format:%H|%ad|%an|%s",
+        "--date=format:%Y-%m-%d %H:%M",
+        f"-{LOG_LIMIT}",
+    ]
+    result = _git(repo_path, cmd, timeout=20)
 
-        for line in result.stdout.strip().split("\n"):
-            if not line.strip():
-                continue
-            try:
-                h, date, author, msg = line.split("|", 3)
-            except ValueError:
-                continue
-            commits.append(
-                {
-                    "hash": h,
-                    "short": h[:12],
-                    "date": date,
-                    "author": author,
-                    "message": msg,
-                }
-            )
+    commits: list[dict] = []
+    if result.returncode != 0:
         return commits
+
+    for line in result.stdout.strip().split("\n"):
+        if not line.strip():
+            continue
+        try:
+            h, date, author, msg = line.split("|", 3)
+        except ValueError:
+            continue
+        commits.append(
+            {
+                "hash": h,
+                "short": h[:12],
+                "date": date,
+                "author": author,
+                "message": msg,
+            }
+        )
+    return commits
 
 
 class HistoryWindow(MaskFadeGuardMixin, MessageBoxBase):
@@ -292,9 +268,9 @@ class HistoryWindow(MaskFadeGuardMixin, MessageBoxBase):
         self._manager = manager
         self.repo_path = ""
 
-        # 后台加载：代数计数（快速切换仓库时丢弃过期结果）+ 线程引用
+        # 后台加载：代数计数（快速切换仓库时丢弃过期结果）+ 当前加载任务
         self._load_generation = 0
-        self._load_threads: list[tuple[QThread, HistoryWorker]] = []
+        self._load_future: QFuture | None = None
 
         # 遮罩弹窗无标题栏，标题显示在内容区顶部
         self.title_label = StrongBodyLabel("版本历史")
@@ -330,55 +306,35 @@ class HistoryWindow(MaskFadeGuardMixin, MessageBoxBase):
         )
 
     # ------------------------------------------------------------------
-    # 数据加载（后台线程）
+    # 数据加载（线程池）
     # ------------------------------------------------------------------
     def load_repo(self, repo_path: str):
-        """后台线程加载指定仓库的本地/远端历史，并计算两侧差异。"""
+        """线程池加载指定仓库的本地/远端历史，并计算两侧差异。"""
         self.repo_path = os.path.abspath(repo_path)
         name = os.path.basename(self.repo_path.rstrip("\\/"))
         self.title_label.setText(f"版本历史 · {name}")
         logger.info(f"[历史] 加载 {self.repo_path}")
 
-        # 代数计数：窗口复用时快速切换仓库，旧线程结果按代数丢弃
+        # 代数计数：窗口复用时快速切换仓库，旧任务结果按代数丢弃
         self._load_generation += 1
         generation = self._load_generation
         self.local_list.set_loading()
         self.remote_list.set_loading()
 
-        worker = HistoryWorker(self.repo_path)
-        thread = QThread()
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-
         def on_loaded(data: dict):
-            self._retire_load_thread(thread)
             if generation == self._load_generation:
                 self._apply_loaded(data)
 
         def on_failed(message: str):
-            self._retire_load_thread(thread)
             if generation == self._load_generation:
                 logger.error(f"[历史] 加载失败 {self.repo_path}: {message}")
                 self.local_list.set_error(f"加载失败: {message}")
                 self.remote_list.set_error("")
 
-        worker.loaded.connect(on_loaded)
-        worker.failed.connect(on_failed)
-
-        # 持有线程引用直至结束，防止运行中被 GC
-        self._load_threads.append((thread, worker))
-        thread.finished.connect(lambda: self._discard_load_thread(thread))
-        thread.start()
-
-    def _retire_load_thread(self, thread: QThread):
-        """结果已回传，请求线程事件循环退出。"""
-        thread.quit()
-
-    def _discard_load_thread(self, thread: QThread):
-        for entry in self._load_threads:
-            if entry[0] is thread:
-                self._load_threads.remove(entry)
-                break
+        self._load_future = (
+            TaskExecutor.run(collect_history, self.repo_path)
+            .then(on_success=on_loaded, on_failed=on_failed)
+        )
 
     def _apply_loaded(self, data: dict):
         """在主线程应用加载结果：计算两侧差异并填充列表。"""
@@ -406,7 +362,9 @@ class HistoryWindow(MaskFadeGuardMixin, MessageBoxBase):
             remote_hint = "橙色行 = 本地尚未包含的提交" if behind else ""
         else:
             local_info = f"本地 · 当前分支: {branch or '游离 HEAD'} · 无对应远端分支"
-            remote_info = f"远端分支 {remote_ref or 'origin/未知'} 不存在（可能未推送或未 fetch）"
+            remote_info = (
+                f"远端分支 {remote_ref or 'origin/未知'} 不存在（可能未推送或未 fetch）"
+            )
             local_hint = ""
             remote_hint = ""
 
@@ -414,26 +372,11 @@ class HistoryWindow(MaskFadeGuardMixin, MessageBoxBase):
         self.remote_list.set_data(remote_commits, remote_only, remote_info, remote_hint)
 
     def done(self, code):
-        """关闭时停止仍在运行的加载线程。"""
-        self._stop_load_threads()
+        """关闭时丢弃仍在执行的加载任务结果（future 由 TaskExecutor 保活至结束）。"""
+        if self._load_future is not None:
+            self._load_future.detach()
+            self._load_future = None
         super().done(code)
-
-    def shutdown(self, timeout_ms: int = 3000):
-        """应用退出前停止并等待所有加载线程结束（避免 QThread 析构崩溃）。"""
-        threads = [t for t, _ in self._load_threads]
-        self._stop_load_threads()
-        for thread in threads:
-            thread.wait(timeout_ms)
-        self._load_threads.clear()
-
-    def _stop_load_threads(self):
-        for thread, worker in list(self._load_threads):
-            for sig in (worker.loaded, worker.failed):
-                try:
-                    sig.disconnect()
-                except (RuntimeError, TypeError):
-                    pass
-            thread.quit()
 
     def reset_to_commit(self, commit: str):
         """硬重置到指定提交后刷新历史。"""

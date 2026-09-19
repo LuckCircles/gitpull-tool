@@ -91,12 +91,15 @@ class GitService:
         return self._runner.run_command(command, cwd=cwd, timeout=timeout, env=env)
 
     def inspect_repository(
-        self, repo_path: str, *, ignored: bool = False, fetch: bool = True
+        self, repo_path: str, *, ignored: bool = False, fetch: bool = True,
+        assume_fresh: bool = False,
     ) -> RepoStatus:
         """Read the status displayed for a repository during a scan.
 
         fetch=False 时仅读取本地信息（分支/版本/远端地址，毫秒级、无网络），
         状态列返回 "⏳ 同步中"，供扫描两阶段加载先行展示仓库列表。
+        assume_fresh=True 时跳过 fetch 直接计算最终状态 —— 适用于刚克隆
+        完成的仓库（远端引用与克隆时一致，再 fetch 是纯冗余网络往返）。
         """
         repo_abs = os.path.abspath(repo_path)
         local_commit, _, _ = self.run_git(repo_abs, ["rev-parse", "--short", "HEAD"])
@@ -131,9 +134,11 @@ class GitService:
                 False,
             )
 
-        # fetch 持仓库锁，与更新(pull)串行化，避免并发写 .git 产生 lock 冲突
-        with self.repo_lock(repo_abs):
-            self.run_git(repo_abs, ["fetch", "--quiet"])
+        # fetch 持仓库锁，与更新(pull)串行化，避免并发写 .git 产生 lock 冲突；
+        # assume_fresh（刚克隆完成）不 fetch，也无需持锁
+        if not assume_fresh:
+            with self.repo_lock(repo_abs):
+                self.run_git(repo_abs, ["fetch", "--quiet"])
         ahead, _, _ = self.run_git(repo_abs, ["rev-list", "--count", "HEAD", "^@{u}"])
         behind, _, _ = self.run_git(repo_abs, ["rev-list", "--count", "@{u}", "^HEAD"])
         remote_commit, _, return_code = self.run_git(

@@ -28,8 +28,9 @@ APP_DATA_DIR = get_app_data_dir()
 CONFIG_FILE = APP_DATA_DIR / "config.json"
 REPO_CACHE_FILE = APP_DATA_DIR / "repo_cache.json"
 
-# 启动时清理旧日志：删除主日志及所有相关文件（轮转产物、.bak 备份等），
-# 每次运行从空日志开始
+# 启动时清理旧日志：仅删除主日志及其衍生文件（轮转产物、.bak 备份等），
+# 每次运行从空日志开始。
+# 注意：config.json / repo_cache.json 等配置文件不受影响，跨次启动保留。
 for _old in APP_DATA_DIR.glob("git_manager.log*"):
     try:
         _old.unlink()
@@ -66,9 +67,9 @@ def _excepthook(exc_type, exc_value, exc_tb):
 
 
 def _thread_excepthook(args: threading.ExceptHookArgs):
-    logger.opt(
-        exception=(args.exc_type, args.exc_value, args.exc_traceback)
-    ).error(f"线程 {args.thread.name if args.thread else '?'} 未捕获的异常")
+    logger.opt(exception=(args.exc_type, args.exc_value, args.exc_traceback)).error(
+        f"线程 {args.thread.name if args.thread else '?'} 未捕获的异常"
+    )
 
 
 sys.excepthook = _excepthook

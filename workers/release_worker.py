@@ -1,4 +1,4 @@
-"""Release 功能工作线程：列表加载（QThread）+ 资产下载（QProcess/deno）"""
+"""Release 功能工作线程：列表加载（TaskExecutor 线程池）+ 资产下载（QProcess/deno）"""
 
 from __future__ import annotations
 
@@ -7,17 +7,37 @@ import os
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QProcess, QThread, Signal
+from PySide6.QtCore import QObject, QProcess, Signal
 from loguru import logger
 
 from core.release_service import extract_github_owner_repo, fetch_releases
+
+
+def fetch_release_list(
+    remote_url: str, token: str | None, proxy: str | None
+) -> tuple[list, str]:
+    """获取 Release 列表（线程安全，经 TaskExecutor 在后台执行）。
+
+    返回 (releases, error)：error 非空表示失败或无结果。
+    """
+    owner_repo = extract_github_owner_repo(remote_url)
+    if not owner_repo:
+        return [], "非 GitHub 仓库或不支持的远程地址"
+    owner, repo = owner_repo
+    releases, error = fetch_releases(owner, repo, token, proxy)
+    if releases is None:
+        return [], error
+    if not releases:
+        return [], f"{owner}/{repo} 没有任何 Release"
+    logger.info(f"[Release] {owner}/{repo} 加载 {len(releases)} 个版本")
+    return releases, ""
 
 
 def _build_tools_candidates() -> list[Path]:
     """构建 tools 目录候选列表（顺序即优先级）。"""
     candidates = [
         Path(__file__).resolve().parent.parent / "tools",  # 开发模式 / 打包后 dist 根
-        Path(sys.executable).resolve().parent / "tools",   # onefile payload 所在目录
+        Path(sys.executable).resolve().parent / "tools",  # onefile payload 所在目录
     ]
     compiled = globals().get("__compiled__")
     if compiled is not None:
@@ -49,37 +69,10 @@ def _locate_tools_dir() -> Path:
     )
     return _TOOLS_CANDIDATES[0]
 
+
 _TOOLS_DIR = _locate_tools_dir()
 DENO_EXE = _TOOLS_DIR / ("deno.exe" if sys.platform == "win32" else "deno")
 DOWNLOAD_TS = _TOOLS_DIR / "download.ts"
-
-
-class ReleaseListWorker(QObject):
-    """Release 列表加载线程"""
-
-    finished = Signal(list, str)  # (releases, error)
-
-    def __init__(self, remote_url: str, token: str | None, proxy: str | None):
-        super().__init__()
-        self.remote_url = remote_url
-        self.token = token
-        self.proxy = proxy
-
-    def run(self):
-        owner_repo = extract_github_owner_repo(self.remote_url)
-        if not owner_repo:
-            self.finished.emit([], "非 GitHub 仓库或不支持的远程地址")
-            return
-        owner, repo = owner_repo
-        releases, error = fetch_releases(owner, repo, self.token, self.proxy)
-        if releases is None:
-            self.finished.emit([], error)
-            return
-        if not releases:
-            self.finished.emit([], f"{owner}/{repo} 没有任何 Release")
-            return
-        logger.info(f"[Release] {owner}/{repo} 加载 {len(releases)} 个版本")
-        self.finished.emit(releases, "")
 
 
 class AssetDownloadManager(QObject):
@@ -95,9 +88,18 @@ class AssetDownloadManager(QObject):
 
     @property
     def is_running(self) -> bool:
-        return self._process is not None and self._process.state() != QProcess.NotRunning
+        return (
+            self._process is not None and self._process.state() != QProcess.NotRunning
+        )
 
-    def start(self, asset_url: str, asset_name: str, output_path: str, token: str | None, proxy: str | None):
+    def start(
+        self,
+        asset_url: str,
+        asset_name: str,
+        output_path: str,
+        token: str | None,
+        proxy: str | None,
+    ):
         """启动下载。已在下载中时忽略。"""
         if self.is_running:
             self.finished.emit(False, "已有下载任务进行中")
@@ -140,7 +142,14 @@ class AssetDownloadManager(QObject):
         logger.info(f"[Release] 开始下载: {asset_name} → {output_path}")
         self._process.start(
             str(DENO_EXE),
-            ["run", "--allow-net", "--allow-read", "--allow-write", str(DOWNLOAD_TS), str(param_file)],
+            [
+                "run",
+                "--allow-net",
+                "--allow-read",
+                "--allow-write",
+                str(DOWNLOAD_TS),
+                str(param_file),
+            ],
         )
         self._param_file = param_file
 
@@ -154,7 +163,9 @@ class AssetDownloadManager(QObject):
     def _on_output(self):
         if not self._process:
             return
-        raw = bytes(self._process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        raw = bytes(self._process.readAllStandardOutput()).decode(
+            "utf-8", errors="replace"
+        )
         for line in raw.splitlines():
             line = line.strip()
             if not line.startswith("{"):
