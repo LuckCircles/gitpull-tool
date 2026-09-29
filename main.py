@@ -56,6 +56,7 @@ from qfluentwidgets import (
 )
 
 from app.config import load_config, save_config, save_repo_cache
+from app.token_store import TokenStore
 from core.git_service import GitService
 from core.proxy_validator import verify_proxy
 from core.repo_service import RepoService
@@ -161,7 +162,11 @@ class GitManager(MSFluentWindow):
         logger.success("Git 多仓库管理器启动成功")
 
     def _load_cached_config(self) -> dict:
-        return load_config()
+        config = load_config()
+        # 明文 token 已由 TokenStore 接管（读取时会自动迁移 config.json）：
+        # 从内存缓存移除，避免任何 _save_cached_config() 将其重新写回 config.json
+        config.pop("token", None)
+        return config
 
     def _save_cached_config(self):
         save_config(self._config_cache)
@@ -202,8 +207,8 @@ class GitManager(MSFluentWindow):
         return str(config.get("proxy") or "http://127.0.0.1:7897").strip()
 
     def load_token(self) -> str:
-        config = self._config_cache
-        return str(config.get("token") or "").strip()
+        """读取访问令牌（统一出口：TokenStore 安全存储，不再读 config.json）。"""
+        return TokenStore.get_token().strip()
 
     def load_release_dir(self) -> str:
         """Release 资产下载目录（空串表示未设置，保存到仓库所在目录）。"""
@@ -573,11 +578,15 @@ class GitManager(MSFluentWindow):
 
         if dialog.exec():
             new_token = dialog.get_text().strip()
-            # 确认即保存（卡片仅显示掩码）
-            self._config_cache["token"] = new_token
-            self._save_cached_config()
+            # 令牌改存 TokenStore（keyring / 本地 secrets 文件），不再写入 config.json
+            if new_token:
+                TokenStore.set_token(new_token)
+                logger.success("访问令牌已更新")
+            else:
+                # 输入为空视为清除令牌
+                TokenStore.clear_token()
+                logger.success("访问令牌已清除")
             self.token_card.setContent(self._mask_token(new_token))
-            logger.success("访问令牌已更新")
 
     def _on_proxy_toggle(self, checked: bool):
         proxy = self.proxy_card.contentLabel.text().strip()
@@ -1000,13 +1009,13 @@ class GitManager(MSFluentWindow):
                 result = RepoService.remove_repo_dir(
                     self.base_dir,
                     repo_name,
-                    onerror=RepoService.make_writable_and_retry,
+                    onexc=RepoService.make_writable_and_retry,
                 )
                 delete_type = "仓库"
             else:
                 # 仅删除.git文件夹
                 result = RepoService.remove_git_metadata(
-                    repo_path, onerror=RepoService.make_writable_and_retry
+                    repo_path, onexc=RepoService.make_writable_and_retry
                 )
                 delete_type = ".git文件夹"
 
@@ -1074,20 +1083,28 @@ class GitManager(MSFluentWindow):
             except ValueError:
                 pass
 
-            # 更新缓存
+            # 更新缓存（同步缓存中的仓库名称字段）
             if repo_path in self._repo_cache:
-                self._repo_cache[new_path] = self._repo_cache.pop(repo_path)
+                cached = self._repo_cache.pop(repo_path)
+                cached["name"] = new_name
+                self._repo_cache[new_path] = cached
 
-            # 更新忽略记录
-            if self.is_repo_ignored(repo_path):
-                self._ignored_repos.discard(repo_path)
-                self._ignored_repos.add(new_path)
+            # 更新忽略记录：忽略列表存于 self._config_cache["ignore_update_repos"]
+            # （绝对路径列表）。重命名不应改变忽略状态，仅同步路径即可。
+            abs_old = os.path.abspath(repo_path)
+            abs_new = os.path.abspath(new_path)
+            if abs_old in self._get_ignore_list():
+                ignore_list = self._get_ignore_list()
+                ignore_list[ignore_list.index(abs_old)] = abs_new
+                self._config_cache["ignore_update_repos"] = ignore_list
+                logger.info(f"[忽略更新] 忽略记录路径已同步: {abs_old} → {abs_new}")
 
-            # 更新表格中的repo_path
+            # 更新表格行：仓库名称与 UserRole 路径一并同步
             row = self.get_row_by_repo_path(repo_path)
             if row != -1:
                 repo_item = self.table.item(row, 1)
                 if repo_item:
+                    repo_item.setText(new_name)
                     repo_item.setData(Qt.UserRole, new_path)
 
             self._save_cached_config()

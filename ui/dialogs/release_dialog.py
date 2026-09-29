@@ -12,9 +12,10 @@ import re
 import time
 from urllib.parse import quote
 
+import markdown
 from loguru import logger
-from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QTextCursor
+from PySide6.QtCore import QSize, Qt, QUrl
+from PySide6.QtGui import QDesktopServices, QTextCursor
 from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
 )
 from qfluentwidgets import (
     BodyLabel,
+    CardWidget,
     HorizontalSeparator,
     IndeterminateProgressBar,
     ListWidget,
@@ -39,6 +41,7 @@ from qfluentwidgets import (
     TableWidget,
     TextBrowser,
 )
+from qfluentwidgets import FluentIcon as FIF
 
 from core.release_service import extract_github_owner_repo
 from ui.widgets.dark_window import MaskFadeGuardMixin, apply_tooltip
@@ -63,94 +66,47 @@ def _fmt_speed(bps: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 发布说明 markdown → HTML（轻量转换：标题/粗体/斜体/行内代码/代码块/链接/列表）
+# 发布说明 markdown → HTML（python-markdown 库，GitHub 风格）
 # ---------------------------------------------------------------------------
-def _md_escape(text: str) -> str:
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def _md_inline(text: str) -> str:
-    """行内元素转换（先转义，code 内不再处理其余格式）。"""
-    text = _md_escape(text)
-    # 行内代码用占位符保护，避免内部内容被链接/加粗规则二次处理
-    code_spans: list[str] = []
-
-    def _stash(m: re.Match) -> str:
-        code_spans.append(m.group(1))
-        return f"\x00{len(code_spans) - 1}\x00"
-
-    text = re.sub(r"`([^`]+)`", _stash, text)
-    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "[图片]", text)  # 图片占位
-    text = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", r'<a href="\2">\1</a>', text)
-    text = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", text)
-    text = re.sub(r"(?<!\*)\*([^*\s][^*]*)\*(?!\*)", r"<i>\1</i>", text)
-    for i, span in enumerate(code_spans):
-        text = text.replace(f"\x00{i}\x00", f"<code>{span}</code>")
-    return text
+# fenced_code: ``` 围栏代码块；tables: GFM 表格；
+# nl2br: 单换行即 <br>（GitHub 行为）；sane_lists: 列表语法修正
+_MD_EXTENSIONS = ("fenced_code", "tables", "nl2br", "sane_lists")
 
 
 def _md_to_html(md: str) -> str:
-    """Release body 常见 markdown 子集 → HTML（GitHub 风格近似）。"""
-    html: list[str] = []
-    code_buf: list[str] = []
-    in_code = False
-    in_list = False
-
-    def close_list():
-        nonlocal in_list
-        if in_list:
-            html.append("</ul>")
-            in_list = False
-
-    for raw in md.replace("\r\n", "\n").split("\n"):
-        line = raw.strip()
-        if line.startswith("```"):
-            if in_code:
-                html.append(
-                    f"<pre>{_md_escape(chr(10).join(code_buf))}</pre>"
-                )
-                code_buf = []
-                in_code = False
-            else:
-                close_list()
-                in_code = True
-            continue
-        if in_code:
-            code_buf.append(raw)
-            continue
-
-        if not line:
-            close_list()
-            continue
-
-        m = re.match(r"^(#{1,6})\s+(.*)", line)
-        if m:
-            close_list()
-            level = min(len(m.group(1)) + 1, 5)  # h2 起步，避免标题过大
-            html.append(f"<h{level}>{_md_inline(m.group(2))}</h{level}>")
-            continue
-
-        if re.match(r"^[-*+]\s+", line):
-            if not in_list:
-                html.append("<ul>")
-                in_list = True
-            html.append(f"<li>{_md_inline(re.sub(r'^[-*+]\\s+', '', line))}</li>")
-            continue
-
-        if re.match(r"^\d+[.)]\s+", line):
-            if not in_list:
-                html.append("<ul>")
-                in_list = True
-            html.append(f"<li>{_md_inline(re.sub(r'^\\d+[.)]\\s+', '', line))}</li>")
-            continue
-
-        close_list()
-        html.append(f"<p>{_md_inline(line)}</p>")
-
-    close_list()
-    if in_code and code_buf:
-        html.append(f"<pre>{_md_escape(chr(10).join(code_buf))}</pre>")
-    return "".join(html) or "<p>（无发布说明）</p>"
+    """Release body → HTML（markdown 库渲染 + Qt 富文本适配后处理）。"""
+    if not md or not md.strip():
+        return "<p>（无发布说明）</p>"
+    html = markdown.markdown(md, extensions=list(_MD_EXTENSIONS))
+    # TextBrowser 不加载远程图片（避免裂图/隐私请求），占位套 code 样式成小标签
+    html = re.sub(r"<img[^>]*>", "<code>[图片]</code>", html)
+    # 代码块：Qt 对块级 background 支持有限，用单元格背景包装出深色容器
+    html = re.sub(
+        r"<pre>(.*?)</pre>",
+        r'<table width="100%" cellspacing="0" cellpadding="10"'
+        r' style="background-color: rgba(0,0,0,80);'
+        r' border: 1px solid rgba(255,255,255,35);">'
+        r"<tr><td><pre>\1</pre></td></tr></table>",
+        html,
+        flags=re.DOTALL,
+    )
+    # 表格：开启网格线（Qt 在单元格间隙中绘制边框，cellspacing 需 ≥1 才有画线空间）
+    html = html.replace(
+        "<table>",
+        '<table cellspacing="1" cellpadding="4" border="1" '
+        'style="border-color: rgba(255,255,255,150);">',
+    )
+    # 引用块：Qt 不支持 border-left，用左侧色条单元格模拟竖线（nbsp 防空单元格塌陷）
+    html = re.sub(
+        r"<blockquote>(.*?)</blockquote>",
+        r'<table cellspacing="0" cellpadding="0"><tr>'
+        r'<td width="4" style="background-color: rgba(255,255,255,170);">&nbsp;</td>'
+        r'<td width="12"></td>'
+        r'<td style="color: rgba(255,255,255,170);">\1</td></tr></table>',
+        html,
+        flags=re.DOTALL,
+    )
+    return html
 
 
 class ReleaseDialog(MaskFadeGuardMixin, MessageBoxBase):
@@ -190,63 +146,82 @@ class ReleaseDialog(MaskFadeGuardMixin, MessageBoxBase):
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(16)
 
-        # 左侧：版本列表（仿 GitHub tag 侧栏）
+        # 左侧：版本列表卡片（仿 GitHub tag 侧栏）
+        # CardWidget 默认 Preferred 尺寸策略会与右列抢宽度，需固定：
+        # 卡片宽 = 列表 200 + 内边距 16
+        left_card = CardWidget()
+        left_card.setFixedWidth(216)
+        left_layout = QVBoxLayout(left_card)
+        left_layout.setContentsMargins(8, 8, 8, 8)
         self.tag_list = ListWidget()
         self.tag_list.setFixedWidth(200)
         self.tag_list.setMinimumHeight(470)
         self.tag_list.itemSelectionChanged.connect(self._on_release_selected)
-        body.addWidget(self.tag_list)
+        left_layout.addWidget(self.tag_list)
+        body.addWidget(left_card)
 
-        # 右侧：上部发布信息 + 下部资产表格
-        right = QVBoxLayout()
-        right.setSpacing(6)
+        # 右侧：发布信息 + 资产文件共用一张卡片
+        right_card = CardWidget()
+        right_layout = QVBoxLayout(right_card)
+        right_layout.setContentsMargins(12, 12, 12, 12)
+        right_layout.setSpacing(8)
 
         self.release_title = SubtitleLabel("")
-        right.addWidget(self.release_title)
+        right_layout.addWidget(self.release_title)
 
         self.release_meta = BodyLabel("")
-        right.addWidget(self.release_meta)
+        right_layout.addWidget(self.release_meta)
 
-        right.addWidget(HorizontalSeparator())
+        right_layout.addWidget(HorizontalSeparator())
 
         self.body_view = TextBrowser()
         self.body_view.setOpenExternalLinks(True)
         self.body_view.setFixedHeight(180)
         self.body_view.document().setDefaultStyleSheet(
             "a { color: #4cc2ff; }"
-            "code { background: rgba(255,255,255,26); }"
-            "pre { background: rgba(255,255,255,20); }"
-            "h2,h3,h4,h5 { color: rgba(255,255,255,228); }"
+            "h1,h2,h3,h4,h5,h6 { color: rgba(255,255,255,228); }"
+            "code { background: rgba(255,255,255,26);"
+            " font-family: Consolas, 'Courier New', monospace; }"
+            "pre { font-family: Consolas, 'Courier New', monospace; }"
+            "pre code { background: transparent; }"
+            "table { border-color: rgba(255,255,255,150); }"
+            "th { background: rgba(255,255,255,32); font-weight: bold;"
+            " padding: 3px 10px; }"
+            "td { padding: 3px 10px; }"
+            "hr { border: none; border-top: 1px solid rgba(255,255,255,50); }"
         )
-        right.addWidget(self.body_view)
-
-        right.addWidget(StrongBodyLabel("资产文件"))
+        right_layout.addWidget(self.body_view)
 
         self.asset_table = TableWidget()
         self.asset_table.setColumnCount(4)
-        self.asset_table.setHorizontalHeaderLabels(
-            ["文件名", "大小", "日期", "下载次数"]
-        )
-        self.asset_table.verticalHeader().setVisible(False)
+        # 水平表头：qfluentwidgets TableWidget 内部有代理表头，
+        # setVisible(False) 对其不生效——清空标签 + 强制隐藏
+        self.asset_table.setHorizontalHeaderLabels(["", "", "", ""])
+        self.asset_table.horizontalHeader().hide()
+        self.asset_table.verticalHeader().hide()
         self.asset_table.setFixedHeight(200)
-        # 列宽分配：文件名列固定上限（超长省略+悬停看全名），其余列自适应内容，
-        # 下载次数列弹性填充剩余空间
+        # 列宽分配：文件名列弹性占大头，大小列自适应内容，
+        # 日期/次数列固定窄宽（次数仅容纳 4-5 位数字）
         self.asset_table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.Interactive
+            0, QHeaderView.Stretch
         )
-        self.asset_table.setColumnWidth(0, 300)
+        self.asset_table.setColumnWidth(0, 380)
         self.asset_table.horizontalHeader().setSectionResizeMode(
             1, QHeaderView.ResizeToContents
         )
         self.asset_table.horizontalHeader().setSectionResizeMode(
-            2, QHeaderView.ResizeToContents
+            2, QHeaderView.Interactive
         )
-        self.asset_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.asset_table.setColumnWidth(2, 110)
+        self.asset_table.horizontalHeader().setSectionResizeMode(
+            3, QHeaderView.Interactive
+        )
+        self.asset_table.setColumnWidth(3, 70)
         self.asset_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.asset_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        right.addWidget(self.asset_table)
+        right_layout.addWidget(self.asset_table)
 
-        body.addLayout(right)
+        body.addWidget(right_card)
 
         self._body_container.setVisible(False)
         self.viewLayout.addWidget(self._body_container)
@@ -261,22 +236,37 @@ class ReleaseDialog(MaskFadeGuardMixin, MessageBoxBase):
         progress_layout = QVBoxLayout(self.progress_area)
         progress_layout.setContentsMargins(12, 6, 12, 6)
         progress_layout.setSpacing(4)
-        progress_layout.addStretch(1)
 
         # 列表加载：不确定进度条
         self.load_progress = IndeterminateProgressBar()
         self.load_progress.setVisible(False)
-        # 资产下载：确定进度条
+        # 资产下载行：确定进度条 + 不确定进度条 + 打开文件夹按钮（下载成功后出现）
+        # 说明：qfluentwidgets 的 ProgressBar 在 setMaximum(0) 时不渲染忙碌动画
+        #（paintEvent 命中 `minimum()>=maximum()` 早退，只画背景细线），
+        # 因此未知大小下载必须改用 IndeterminateProgressBar 提供动态反馈，
+        # 已知大小仍用确定 ProgressBar。两者同处一行，按 total 互斥显示。
         self.download_progress = ProgressBar()
         self.download_progress.setVisible(False)
+        self.download_progress_busy = IndeterminateProgressBar(start=False)
+        self.download_progress_busy.setVisible(False)
+        self._last_download_dir = ""
+        self.open_folder_btn = PushButton(FIF.FOLDER, "打开文件夹")
+        self.open_folder_btn.setVisible(False)
+        self.open_folder_btn.clicked.connect(self._open_download_folder)
+        apply_tooltip(self.open_folder_btn, "打开本次下载所在文件夹")
+        download_row = QHBoxLayout()
+        download_row.setContentsMargins(0, 0, 0, 0)
+        download_row.addWidget(self.download_progress, 1)
+        download_row.addWidget(self.download_progress_busy, 1)
+        download_row.addWidget(self.open_folder_btn)
         self.download_status = BodyLabel("")
+        self.download_status.setFixedHeight(20)
         self.download_status.setVisible(False)
         progress_layout.addWidget(self.load_progress)
-        progress_layout.addWidget(self.download_progress)
+        progress_layout.addLayout(download_row)
         progress_layout.addWidget(self.download_status)
-        progress_layout.addStretch(1)
-        # 固定高度：空态（无加载/下载）区域依然完整保留
-        self.progress_area.setFixedHeight(64)
+        # 最小高度：空态（无加载/下载）区域仍保持可见；有内容时自动撑高
+        self.progress_area.setMinimumHeight(64)
         self.viewLayout.addWidget(self.progress_area)
 
         # ---------- 下载管理器 ----------
@@ -359,10 +349,11 @@ class ReleaseDialog(MaskFadeGuardMixin, MessageBoxBase):
                 badges.append("Latest")
             if rel["prerelease"]:
                 badges.append("预发布")
+            # 列表项不显示发布时间（日期保留在悬停提示中）
+            sub = " · ".join(badges)
             date = rel["published_at"] or "未发布"
-            sub = " · ".join([date, *badges]) if badges else date
-            item = QListWidgetItem(f"{tag}\n{sub}")
-            item.setSizeHint(QSize(180, 46))
+            item = QListWidgetItem(f"{tag}\n{sub}" if sub else tag)
+            item.setSizeHint(QSize(180, 46 if sub else 32))
             item.setToolTip(f"{rel['name']}\n{tag} · {date}")
             item.setData(Qt.UserRole, rel)
             self.tag_list.addItem(item)
@@ -447,16 +438,8 @@ class ReleaseDialog(MaskFadeGuardMixin, MessageBoxBase):
     # ------------------------------------------------------------------
     @staticmethod
     def _unique_save_path(base: str, name: str) -> str:
-        """在目录内生成不冲突的保存路径：已存在时追加 (1)、(2)… 序号。"""
-        candidate = os.path.join(base, name)
-        if not os.path.exists(candidate):
-            return candidate
-        stem, ext = os.path.splitext(name)
-        for i in range(1, 1000):
-            candidate = os.path.join(base, f"{stem} ({i}){ext}")
-            if not os.path.exists(candidate):
-                return candidate
-        return os.path.join(base, name)  # 极端情况：原样返回
+        """直接返回目标路径——同文件名覆盖，不生成序号副本。"""
+        return os.path.join(base, name)
 
     def download_asset(self):
         if self.download_manager.is_running:
@@ -482,8 +465,16 @@ class ReleaseDialog(MaskFadeGuardMixin, MessageBoxBase):
                 return
 
         self.download_btn.setEnabled(False)
-        self.download_progress.setVisible(True)
+        self.open_folder_btn.setVisible(False)
+        # 下载开始时大小未知 → 先用不确定进度条给即时动态反馈，
+        # 首个 total>0 的进度信号到达后切换为确定进度条。
         self.download_progress.setValue(0)
+        self.download_progress.setVisible(False)
+        self.download_progress_busy.setVisible(True)
+        if not self.download_progress_busy.isStarted():
+            self.download_progress_busy.start()
+        # 记录本次下载目录（成功后供"打开文件夹"使用）
+        self._last_download_dir = os.path.dirname(save_path)
         # 进度采样窗口重置（速度 = 窗口内字节增量 / 时间增量）
         self._speed_samples: list[tuple[float, int]] = [(time.monotonic(), 0)]
         self.download_status.setText(f"正在下载 {file_name} …")
@@ -499,11 +490,20 @@ class ReleaseDialog(MaskFadeGuardMixin, MessageBoxBase):
 
     def _on_download_progress(self, received: int, total: int, name: str):
         if total > 0:
+            # 已知大小：切换为确定进度条
+            if self.download_progress_busy.isVisible():
+                self.download_progress_busy.stop()
+                self.download_progress_busy.setVisible(False)
+                self.download_progress.setVisible(True)
             self.download_progress.setMaximum(total)
             self.download_progress.setValue(min(received, total))
         else:
-            # 未知大小：显示不确定进度
-            self.download_progress.setMaximum(0)
+            # 未知大小：不确定进度条做忙碌指示
+            #（qfluentwidgets ProgressBar 的 setMaximum(0) 不渲染动画，已弃用）
+            if not self.download_progress.isVisible():
+                self.download_progress_busy.setVisible(True)
+                if not self.download_progress_busy.isStarted():
+                    self.download_progress_busy.start()
 
         # 速度：最近 3 秒采样窗口内的平均速率（瞬时值抖动大，不做）
         now = time.monotonic()
@@ -528,10 +528,15 @@ class ReleaseDialog(MaskFadeGuardMixin, MessageBoxBase):
     def _on_download_finished(self, success: bool, message: str):
         # 区域常驻：仅隐藏进度条与状态文本
         self.download_progress.setVisible(False)
+        self.download_progress_busy.stop()
+        self.download_progress_busy.setVisible(False)
         self.download_status.setVisible(False)
         self._speed_samples = []
         self.download_btn.setEnabled(self.asset_table.rowCount() > 0)
         if success:
+            # 成功后在进度条原位显示"打开文件夹"入口
+            if self._last_download_dir and os.path.isdir(self._last_download_dir):
+                self.open_folder_btn.setVisible(True)
             from qfluentwidgets import InfoBar
 
             InfoBar.success("下载完成", message, parent=self)
@@ -539,6 +544,11 @@ class ReleaseDialog(MaskFadeGuardMixin, MessageBoxBase):
             from qfluentwidgets import InfoBar
 
             InfoBar.error("下载失败", message[:150], parent=self)
+
+    def _open_download_folder(self):
+        """在系统资源管理器中打开本次下载所在目录。"""
+        if self._last_download_dir and os.path.isdir(self._last_download_dir):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self._last_download_dir))
 
     # ------------------------------------------------------------------
     # 关闭清理

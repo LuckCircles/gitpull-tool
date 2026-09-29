@@ -45,7 +45,7 @@ logger.add(
     encoding="utf-8",
     enqueue=True,  # 队列写入：多线程安全，不阻塞 UI 线程
     backtrace=True,  # 异常时输出完整调用链
-    diagnose=True,  # 异常栈附带变量值，便于定位问题
+    diagnose=False,  # 关闭变量值 dump：避免异常栈把局部变量（可能含 token）写入日志
     catch=True,  # sink 自身异常不打断应用
     format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message}",
 )

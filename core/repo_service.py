@@ -14,7 +14,10 @@ class RepoService:
 
     @staticmethod
     def remove_repo_dir(
-        base_path: str, repo_name: str, onerror: Callable | None = None
+        base_path: str,
+        repo_name: str,
+        onerror: Callable | None = None,
+        onexc: Callable | None = None,
     ) -> dict:
         result = {"success": False, "error": None}
         if not repo_name or not repo_name.strip():
@@ -43,14 +46,18 @@ class RepoService:
             return result
 
         try:
-            rmtree(target_abs, onerror=onerror)
+            rmtree(target_abs, onerror=onerror, onexc=onexc)
             result["success"] = True
         except Exception as exc:
             result["error"] = str(exc)
         return result
 
     @staticmethod
-    def remove_git_metadata(repo_path: str, onerror: Callable | None = None) -> dict:
+    def remove_git_metadata(
+        repo_path: str,
+        onerror: Callable | None = None,
+        onexc: Callable | None = None,
+    ) -> dict:
         result = {"success": False, "error": None}
         repo_abs = os.path.abspath(repo_path)
         if not os.path.isdir(repo_abs):
@@ -63,7 +70,7 @@ class RepoService:
             return result
 
         try:
-            rmtree(git_dir, onerror=onerror)
+            rmtree(git_dir, onerror=onerror, onexc=onexc)
             result["success"] = True
         except Exception as exc:
             result["error"] = str(exc)
@@ -71,6 +78,12 @@ class RepoService:
 
     @staticmethod
     def make_writable_and_retry(func, path, exc):
+        """rmtree 的 onexc 回调（Python 3.12+ 标准签名，第三参为异常实例）。
+
+        经 utils.subprocess_utils.rmtree 规范化后，第三参恒为异常实例；
+        为兼容直接以 onerror 形式传入的旧调用点，仍保留元组解包兜底。
+        只读文件触发 OSError 时改写权限并重试原操作，其余异常原样抛出。
+        """
         actual_exc = exc[1] if isinstance(exc, tuple) else exc
         if isinstance(actual_exc, OSError):
             os.chmod(path, stat.S_IWRITE)

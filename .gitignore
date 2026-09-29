@@ -11,11 +11,23 @@ wheels/
 venv/
 env/
 ENV/
+deliverables/
+test/
 .claude/
 .agents/
 .mypy_cache/
 .python-checkup-cache/
 .ruff_cache/
+.pytest_cache/
+
+# WorkBuddy 本地会话/记忆数据（不入库）
+.workbuddy/
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
 # IDE
 .vscode/
 .idea/
@@ -28,36 +40,18 @@ releases/
 *.msi
 
 # Logs and databases
+git_manager.log
 *.log
 *.sql
 *.sqlite
 
-# Config files (if contains sensitive info)
+# Sensitive config & secrets (token 已迁移至 keyring/secrets.json，禁止入库)
 config.json
+secrets.json
 .env
-*.json
-
-# Python-generated files
-__pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-
-# Virtual environments
-.venv
-venv/
-env/
-ENV/
+repo_cache.json
 
 # Binary and config files
-*.exe
-*.msi
-config.json
-*.log
-
-repo_cache.json
 reword.py
 
 # Batch scripts

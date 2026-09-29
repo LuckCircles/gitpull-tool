@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Tuple
 
 from core.token_validator import _curl_json
-from utils.github_url_utils import _extract_owner_repo, _VALID_OWNER, _VALID_REPO
+from utils.github_url_utils import _VALID_OWNER, _VALID_REPO, _extract_owner_repo
 
 
-def extract_github_owner_repo(remote_url: str) -> Tuple[str, str] | None:
+def extract_github_owner_repo(remote_url: str) -> tuple[str, str] | None:
     """
     从仓库远程地址提取 (owner, repo)。
 
@@ -37,8 +36,8 @@ def fetch_releases(
     token: str | None = None,
     proxy: str | None = None,
     timeout: int = 15,
-    per_page: int = 20,
-) -> Tuple[list[dict] | None, str]:
+    per_page: int = 100,
+) -> tuple[list[dict] | None, str]:
     """
     查询仓库的 Release 列表。
 

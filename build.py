@@ -38,6 +38,9 @@ def compile_with_nuitka():
         # 运行时经 __compiled__.containing_dir/tools 定位（见 workers/release_worker.py）
         "--include-data-files=tools/deno.exe=tools/deno.exe",
         "--include-data-files=tools/download.ts=tools/download.ts",
+        # markdown 库的扩展经 entry points 动态导入，
+        # 静态 follow-imports 收集不到，需整包包含（Release 说明渲染）
+        "--include-package=markdown",
         f"--output-filename={OUTPUT_NAME}",
         # f"--file-version={VERSION}",
         "--warn-implicit-exceptions",
