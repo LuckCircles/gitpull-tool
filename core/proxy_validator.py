@@ -2,13 +2,13 @@
 
 import re
 import subprocess
+import time
 import urllib.parse
-from typing import Tuple
 
 from utils.subprocess_utils import run_hidden
 
 
-def validate_proxy_format(proxy: str) -> Tuple[bool, str]:
+def validate_proxy_format(proxy: str) -> tuple[bool, str]:
     """
     验证代理格式
 
@@ -51,12 +51,12 @@ def validate_proxy_format(proxy: str) -> Tuple[bool, str]:
         return True, ""
 
     except Exception as e:
-        return False, f"代理地址格式错误: {str(e)}"
+        return False, f"代理地址格式错误: {e!s}"
 
 
 def test_github_connectivity(
     proxy: str | None = None, timeout: int = 5
-) -> Tuple[bool, str]:
+) -> tuple[bool, str]:
     """
     测试 GitHub 连接性
 
@@ -113,7 +113,48 @@ def test_github_connectivity(
         return False, f"连接测试出错: {str(e)[:100]}"
 
 
-def verify_proxy(proxy: str | None = None, timeout: int = 5) -> Tuple[bool, str]:
+def measure_git_latency(
+    proxy: str | None = None, timeout: int = 10, samples: int = 3
+) -> tuple[bool, str]:
+    """测量与 GitHub 的 Git 连接延迟（线程安全，经 TaskExecutor 后台执行）。
+
+    通过 `git ls-remote` 触发完整的 smart-HTTP 往返（DNS + TCP + TLS +
+    HTTP + refs 协商），最接近实际 fetch/pull 的连接开销。多次采样
+    取最小值（首连含冷启动开销，最小值最能代表链路质量）与平均值。
+
+    返回: (是否成功, 结果信息)。
+    """
+    url = "https://github.com/octocat/Hello-World.git"
+    cmd = ["git"]
+    if proxy and proxy.strip():
+        cmd += ["-c", f"http.proxy={proxy.strip()}"]
+    cmd += ["ls-remote", url, "HEAD"]
+
+    times_ms: list[float] = []
+    for _ in range(samples):
+        t0 = time.perf_counter()
+        try:
+            result = run_hidden(cmd, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return False, f"连接超时（>{timeout}秒）"
+        except FileNotFoundError:
+            return False, "git 命令未找到"
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        if result.returncode != 0:
+            lines = (result.stderr or "").strip().splitlines()
+            msg = lines[-1] if lines else f"git 退出码 {result.returncode}"
+            # 截掉 "fatal: unable to access 'URL': " 前缀，只留可读原因
+            if "': " in msg:
+                msg = msg.split("': ", 1)[1]
+            return False, f"连接失败: {msg[:80]}"
+        times_ms.append(elapsed_ms)
+
+    best = min(times_ms)
+    avg = sum(times_ms) / len(times_ms)
+    return True, f"最快 {best:.0f} ms · 平均 {avg:.0f} ms（{samples} 次采样）"
+
+
+def verify_proxy(proxy: str | None = None, timeout: int = 5) -> tuple[bool, str]:
     """
     完整的代理验证流程
 

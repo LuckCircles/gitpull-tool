@@ -8,12 +8,18 @@
 
 适用：一次性轻量任务（网络请求、git 命令序列、数据加载）。
 不适用：流式进度回传的长任务（如克隆）和子进程管理（如资产下载），仍用专用 Worker/QProcess。
+
+双池设计：
+- run()      → 批量池（全局池）：扫描 / 更新（pull）/ 校验等长任务
+- run_ui()   → 交互池（独立小池）：弹窗数据加载（分支 / 版本历史 / Release）
+批量 pull 占满全局池时，弹窗加载仍能立即获得线程，无需等待更新完成。
 """
 
 from __future__ import annotations
 
 import warnings
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any, ClassVar
 
 from loguru import logger
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
@@ -43,7 +49,7 @@ class QFuture(QObject):
         self,
         on_success: Callable | None = None,
         on_failed: Callable | None = None,
-    ) -> "QFuture":
+    ) -> QFuture:
         """链式注册回调（主线程执行），返回自身可继续链式。"""
         if on_success is not None:
             self.result.connect(on_success)
@@ -81,7 +87,7 @@ class _Task(QRunnable):
         self._args = args
         self._kwargs = kwargs
 
-    def run(self):  # noqa: D102 — QRunnable 线程池入口
+    def run(self):
         try:
             value = self._target(*self._args, **self._kwargs)
         except Exception as e:  # noqa: BLE001 后台线程兜底，异常经信号回传
@@ -99,7 +105,11 @@ class TaskExecutor:
     """全局任务执行器（全局线程池，跨窗口复用）。"""
 
     _pool = QThreadPool.globalInstance()
-    _futures: set[QFuture] = set()  # 运行中任务的保活引用
+    # 交互池：弹窗数据加载专用，与批量任务（扫描/更新）物理隔离，
+    # 批量 pull 占满全局池时弹窗仍可立即加载
+    _ui_pool = QThreadPool()
+    _ui_pool.setMaxThreadCount(4)
+    _futures: ClassVar[set[QFuture]] = set()  # 运行中任务的保活引用
 
     @classmethod
     def run(cls, target: Callable, *args: Any, **kwargs: Any) -> QFuture:
@@ -113,6 +123,18 @@ class TaskExecutor:
         return future
 
     @classmethod
+    def run_ui(cls, target: Callable, *args: Any, **kwargs: Any) -> QFuture:
+        """提交交互式加载任务（弹窗数据）到独立线程池。
+
+        与 run() 的批量池隔离：更新仓库（pull）占满批量池期间，
+        分支 / 版本历史 / Release 弹窗的加载不受排队影响。
+        """
+        future = QFuture()
+        cls._futures.add(future)
+        cls._ui_pool.start(_Task(future, target, args, kwargs))
+        return future
+
+    @classmethod
     def setMaxThreads(cls, count: int):
         """设置线程池最大线程数（应用启动时调用一次）。
 
@@ -123,5 +145,6 @@ class TaskExecutor:
 
     @classmethod
     def waitForDone(cls, timeout_ms: int = 5000) -> bool:
-        """等待所有任务完成（应用退出前调用）。"""
-        return cls._pool.waitForDone(timeout_ms)
+        """等待所有任务完成（应用退出前调用，含批量池与交互池）。"""
+        ok = cls._pool.waitForDone(timeout_ms)
+        return cls._ui_pool.waitForDone(timeout_ms) and ok

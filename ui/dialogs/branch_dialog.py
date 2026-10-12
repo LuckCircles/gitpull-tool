@@ -1,25 +1,29 @@
 """分支管理对话框 — Fluent 遮罩弹窗 + 分支列表线程池加载。
 
 fetch 是网络操作（超时 30s），在主线程执行会冻结整个窗口，
-因此加载流程经 TaskExecutor 提交到全局线程池，通过 Signal 回传结果。
+因此加载流程经 TaskExecutor.run_ui 提交到交互线程池（与批量
+更新池隔离，更新仓库期间也能立即加载），通过 Signal 回传结果。
 """
 
 import os
 
 from loguru import logger
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
     QHeaderView,
     QTableWidget,
     QTableWidgetItem,
+    QVBoxLayout,
 )
 from qfluentwidgets import (
+    CardWidget,
     IndeterminateProgressBar,
     MessageBoxBase,
     PushButton,
     StrongBodyLabel,
     TableWidget,
+    isDarkTheme,
 )
 
 from core.git_runner import GitRunner
@@ -91,6 +95,52 @@ def collect_branches(repo_path: str) -> list[dict]:
     return rows
 
 
+def _wrap_tip(text: str, width: int = 40) -> str:
+    """按字符数折行（对中文安全：不依赖空格分词），用于悬停放大提示。"""
+    text = text.strip()
+    if not text:
+        return "（无提交信息）"
+    return "\n".join(text[i : i + width] for i in range(0, len(text), width))
+
+
+class TrackedIndeterminateProgressBar(IndeterminateProgressBar):
+    """带轨道底色的不定进度条（修复残影）。
+
+    qfluentwidgets 原版 paintEvent 只画两个滑块：不铺轨道底色也不裁剪，
+    且动画位置可达 1.75×width（滑块画出控件边界）。每帧仅重绘滑块
+    本身，上一帧未被覆盖的像素在 4px 高的细条上表现为亮色残影。
+
+    本子类每帧先用轨道底色铺满整个控件矩形（强制覆盖上一帧全部
+    像素），再把滑块绘制裁剪到控件边界内。
+    """
+
+    def paintEvent(self, e):
+        painter = QPainter(self)
+        painter.setRenderHints(QPainter.Antialiasing)
+        painter.setClipRect(self.rect())
+
+        # 轨道底色：整条铺满，覆盖上一帧所有像素（配色与 ProgressBar 轨道一致）
+        track = QColor(255, 255, 255, 155) if isDarkTheme() else QColor(0, 0, 0, 155)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(track)
+        r = self.height() / 2
+        painter.drawRoundedRect(self.rect(), r, r)
+
+        # 滑块仅在实际加载时绘制：stop() 只是暂停动画，滑块位置会冻结，
+        # 常驻显示下必须隐藏冻结滑块，空闲状态只保留干净的轨道
+        if not self.isStarted():
+            return
+
+        # 短滑块 + 长滑块（绘制已被裁剪在控件矩形内）
+        painter.setBrush(self.barColor())
+        x = int((self.shortPos - 0.4) * self.width())
+        w = int(0.4 * self.width())
+        painter.drawRoundedRect(x, 0, w, self.height(), r, r)
+        x = int((self.longPos - 0.6) * self.width())
+        w = int(0.6 * self.width())
+        painter.drawRoundedRect(x, 0, w, self.height(), r, r)
+
+
 class BranchDialog(MaskFadeGuardMixin, MessageBoxBase):
     """分支管理对话框（Fluent 遮罩弹窗，分支列表线程池加载，UI 不冻结）"""
 
@@ -105,10 +155,6 @@ class BranchDialog(MaskFadeGuardMixin, MessageBoxBase):
 
         # 遮罩弹窗无标题栏，标题显示在内容区顶部
         self.viewLayout.addWidget(StrongBodyLabel(f"分支管理 · {repo_name}"))
-
-        self.progress = IndeterminateProgressBar()
-        self.progress.setVisible(False)
-        self.viewLayout.addWidget(self.progress)
 
         self.table = TableWidget()
         self.table.setColumnCount(5)
@@ -135,6 +181,14 @@ class BranchDialog(MaskFadeGuardMixin, MessageBoxBase):
         self.table.itemDoubleClicked.connect(self.on_double_click)
         self.viewLayout.addWidget(self.table)
 
+        # 底部进度卡片：常驻显示（空闲时仅剩轨道底色，加载时动画扫动）
+        self.progress_card = CardWidget()
+        card_layout = QVBoxLayout(self.progress_card)
+        card_layout.setContentsMargins(16, 12, 16, 12)
+        self.progress = TrackedIndeterminateProgressBar(start=False)
+        card_layout.addWidget(self.progress)
+        self.viewLayout.addWidget(self.progress_card)
+
         # 底部按钮：「切换分支」「关闭窗口」均为普通按钮
         # （隐藏自带的主色 yesButton，在按钮区左侧插入普通按钮，等宽分布）
         self.yesButton.hide()
@@ -157,7 +211,7 @@ class BranchDialog(MaskFadeGuardMixin, MessageBoxBase):
         self._set_loading(True)
 
         self._load_future = (
-            TaskExecutor.run(collect_branches, self.repo_path)
+            TaskExecutor.run_ui(collect_branches, self.repo_path)
             .then(
                 on_success=self._on_branches_loaded,
                 on_failed=self._on_branches_failed,
@@ -166,12 +220,11 @@ class BranchDialog(MaskFadeGuardMixin, MessageBoxBase):
 
     def _set_loading(self, loading: bool):
         self.switch_btn.setEnabled(not loading)
+        # 进度卡片常驻：仅切换动画，不隐藏控件
         if loading:
-            self.progress.setVisible(True)
             self.progress.start()
         else:
             self.progress.stop()
-            self.progress.setVisible(False)
 
     def _on_branches_loaded(self, rows: list[dict]):
         self._set_loading(False)
@@ -203,10 +256,11 @@ class BranchDialog(MaskFadeGuardMixin, MessageBoxBase):
                 row, 1, QTableWidgetItem("远程" if r["is_remote"] else "本地")
             )
             self.table.setItem(row, 2, QTableWidgetItem("✓" if r["is_current"] else ""))
-            self.table.setItem(
-                row, 3, QTableWidgetItem(f"{r['commit']}  {r['date']}".strip())
-            )
-            self.table.setItem(row, 4, QTableWidgetItem(r["message"]))
+            self.table.setItem(row, 3, QTableWidgetItem(f"{r['commit']}  {r['date']}".strip()))
+            # 提交信息列：悬停显示完整提交说明（Fluent 气泡，折行放大展示）
+            msg_item = QTableWidgetItem(r["message"])
+            msg_item.setToolTip(_wrap_tip(r["message"]))
+            self.table.setItem(row, 4, msg_item)
 
             if r["is_current"]:
                 for col in range(5):

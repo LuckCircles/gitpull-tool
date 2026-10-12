@@ -9,7 +9,8 @@
             └── _CommitList(remote=True)   → git log origin/<当前分支>
 
 加载流程（线程池）：
-    git 命令序列经 TaskExecutor 提交到全局线程池，结果经 Signal 回传；
+    git 命令序列经 TaskExecutor.run_ui 提交到交互线程池（与批量
+    更新池隔离，更新仓库期间也能立即加载），结果经 Signal 回传；
     快速切换仓库时按代数（generation）丢弃过期结果。
 
 本地/远端区分：
@@ -26,7 +27,6 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
-    QLabel,
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -94,9 +94,6 @@ class _CommitList(QWidget):
         layout.addWidget(self.table, 1)
 
         btn_layout = QHBoxLayout()
-        self.hint_label = QLabel("")
-        self.hint_label.setStyleSheet("color:#ff9800;")
-        btn_layout.addWidget(self.hint_label)
         btn_layout.addStretch()
         # 两个按钮均分剩余宽度，铺满整行
         self.switch_btn = PushButton(FIF.UPDATE, "切换版本")
@@ -112,13 +109,11 @@ class _CommitList(QWidget):
     def set_loading(self):
         """加载中占位状态（后台线程执行 git 命令期间）。"""
         self.info_label.setText("正在加载提交历史...")
-        self.hint_label.setText("")
         self.table.setRowCount(0)
 
     def set_error(self, message: str):
         """加载失败状态。"""
         self.info_label.setText(message or "加载失败")
-        self.hint_label.setText("")
         self.table.setRowCount(0)
 
     def set_data(
@@ -126,11 +121,9 @@ class _CommitList(QWidget):
         commits: list[dict],
         diverged: set[str],
         info_text: str,
-        hint_text: str,
     ):
         """填充提交列表并高亮差异行。"""
         self.info_label.setText(info_text)
-        self.hint_label.setText(hint_text)
 
         self.table.setRowCount(0)
         for i, c in enumerate(commits):
@@ -332,7 +325,7 @@ class HistoryWindow(MaskFadeGuardMixin, MessageBoxBase):
                 self.remote_list.set_error("")
 
         self._load_future = (
-            TaskExecutor.run(collect_history, self.repo_path)
+            TaskExecutor.run_ui(collect_history, self.repo_path)
             .then(on_success=on_loaded, on_failed=on_failed)
         )
 
@@ -358,18 +351,14 @@ class HistoryWindow(MaskFadeGuardMixin, MessageBoxBase):
             else:
                 local_info = f"本地 · 当前分支: {branch} · 未推送 {ahead} 个提交"
                 remote_info = f"远端 · {remote_ref} · 未拉取 {behind} 个提交"
-            local_hint = "橙色行 = 尚未推送到远端的提交" if ahead else ""
-            remote_hint = "橙色行 = 本地尚未包含的提交" if behind else ""
         else:
             local_info = f"本地 · 当前分支: {branch or '游离 HEAD'} · 无对应远端分支"
             remote_info = (
                 f"远端分支 {remote_ref or 'origin/未知'} 不存在（可能未推送或未 fetch）"
             )
-            local_hint = ""
-            remote_hint = ""
 
-        self.local_list.set_data(local_commits, local_only, local_info, local_hint)
-        self.remote_list.set_data(remote_commits, remote_only, remote_info, remote_hint)
+        self.local_list.set_data(local_commits, local_only, local_info)
+        self.remote_list.set_data(remote_commits, remote_only, remote_info)
 
     def done(self, code):
         """关闭时丢弃仍在执行的加载任务结果（future 由 TaskExecutor 保活至结束）。"""

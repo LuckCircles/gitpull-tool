@@ -40,6 +40,7 @@ from qfluentwidgets import (
     SubtitleLabel,
     TableWidget,
     TextBrowser,
+    ToolButton,
 )
 from qfluentwidgets import FluentIcon as FIF
 
@@ -63,6 +64,37 @@ def _fmt_speed(bps: float) -> str:
     if bps >= 1024:
         return f"{bps / 1024:.1f} KB/s"
     return f"{bps:.0f} B/s"
+
+
+def _fmt_count(n) -> str:
+    """下载次数紧凑格式（GitHub stars 风格）：1000→1k、1234→1.2k、12k、1M、1.2M。
+
+    便于在窄列里完整显示，避免原始大数字被截断；完整值由单元格 tooltip 提供。
+    """
+    if n is None:
+        return "-"
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return "-"
+    if n < 0:
+        return str(n)
+    if n < 1000:
+        return str(n)
+
+    def _compact(div: int, suffix: str) -> str:
+        v = n / div
+        if v < 10:
+            s = f"{v:.1f}".rstrip("0").rstrip(".")  # 1.2 / 1（x.0 去尾零）
+        else:
+            s = str(int(v))  # 12、123
+        return s + suffix
+
+    if n < 1_000_000:
+        return _compact(1000, "k")
+    if n < 1_000_000_000:
+        return _compact(1_000_000, "M")
+    return _compact(1_000_000_000, "B")
 
 
 # ---------------------------------------------------------------------------
@@ -254,10 +286,21 @@ class ReleaseDialog(MaskFadeGuardMixin, MessageBoxBase):
         self.open_folder_btn.setVisible(False)
         self.open_folder_btn.clicked.connect(self._open_download_folder)
         apply_tooltip(self.open_folder_btn, "打开本次下载所在文件夹")
+        # 下载控制：暂停/恢复 + 取消（ToolButton，下载中/已暂停时可见）
+        self.pause_btn = ToolButton(FIF.PAUSE)
+        apply_tooltip(self.pause_btn, "暂停 / 恢复下载")
+        self.pause_btn.setVisible(False)
+        self.pause_btn.clicked.connect(self._toggle_pause)
+        self.cancel_btn = ToolButton(FIF.CANCEL)
+        apply_tooltip(self.cancel_btn, "取消下载（删除半成品）")
+        self.cancel_btn.setVisible(False)
+        self.cancel_btn.clicked.connect(self._cancel_download)
         download_row = QHBoxLayout()
         download_row.setContentsMargins(0, 0, 0, 0)
         download_row.addWidget(self.download_progress, 1)
         download_row.addWidget(self.download_progress_busy, 1)
+        download_row.addWidget(self.pause_btn)
+        download_row.addWidget(self.cancel_btn)
         download_row.addWidget(self.open_folder_btn)
         self.download_status = BodyLabel("")
         self.download_status.setFixedHeight(20)
@@ -273,6 +316,7 @@ class ReleaseDialog(MaskFadeGuardMixin, MessageBoxBase):
         self.download_manager = AssetDownloadManager(self)
         self.download_manager.progress.connect(self._on_download_progress)
         self.download_manager.finished.connect(self._on_download_finished)
+        self.download_manager.paused.connect(self._on_download_paused)
 
         # ---------- 底部按钮 ----------
         self.yesButton.hide()
@@ -294,7 +338,7 @@ class ReleaseDialog(MaskFadeGuardMixin, MessageBoxBase):
         self._set_loading(True)
 
         self._load_future = (
-            TaskExecutor.run(fetch_release_list, remote_url, token, proxy)
+            TaskExecutor.run_ui(fetch_release_list, remote_url, token, proxy)
             .then(
                 on_success=lambda result: self._on_loaded(*result),
                 on_failed=lambda message: self._on_loaded([], message),
@@ -427,9 +471,11 @@ class ReleaseDialog(MaskFadeGuardMixin, MessageBoxBase):
                 row, 2, QTableWidgetItem(asset.get("updated_at", "") or "-")
             )
             count = asset.get("download_count")
-            self.asset_table.setItem(
-                row, 3, QTableWidgetItem(str(count) if count is not None else "-")
-            )
+            count_item = QTableWidgetItem(_fmt_count(count))
+            # 紧凑显示（1.2k / 12k / 1.2M）防窄列截断；tooltip 给完整次数便于查看
+            count_item.setToolTip(str(count) if count is not None else "-")
+            count_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.asset_table.setItem(row, 3, count_item)
             self.asset_table.item(row, 0).setData(Qt.UserRole, asset)
         self.download_btn.setEnabled(bool(assets))
 
@@ -466,6 +512,10 @@ class ReleaseDialog(MaskFadeGuardMixin, MessageBoxBase):
 
         self.download_btn.setEnabled(False)
         self.open_folder_btn.setVisible(False)
+        # 显示暂停 / 取消控制按钮；暂停按钮初始为 PAUSE 图标
+        self.pause_btn.setIcon(FIF.PAUSE)
+        self.pause_btn.setVisible(True)
+        self.cancel_btn.setVisible(True)
         # 下载开始时大小未知 → 先用不确定进度条给即时动态反馈，
         # 首个 total>0 的进度信号到达后切换为确定进度条。
         self.download_progress.setValue(0)
@@ -532,6 +582,10 @@ class ReleaseDialog(MaskFadeGuardMixin, MessageBoxBase):
         self.download_progress_busy.setVisible(False)
         self.download_status.setVisible(False)
         self._speed_samples = []
+        # 结束态：隐藏暂停/取消按钮，重置暂停图标
+        self.pause_btn.setIcon(FIF.PAUSE)
+        self.pause_btn.setVisible(False)
+        self.cancel_btn.setVisible(False)
         self.download_btn.setEnabled(self.asset_table.rowCount() > 0)
         if success:
             # 成功后在进度条原位显示"打开文件夹"入口
@@ -544,6 +598,29 @@ class ReleaseDialog(MaskFadeGuardMixin, MessageBoxBase):
             from qfluentwidgets import InfoBar
 
             InfoBar.error("下载失败", message[:150], parent=self)
+
+    def _on_download_paused(self, received: int, total: int):
+        """下载已暂停：暂停按钮切为恢复图标，状态文本提示可恢复。"""
+        self.pause_btn.setIcon(FIF.PLAY)
+        self.download_progress_busy.stop()
+        self.download_progress_busy.setVisible(False)
+        if total > 0:
+            text = f"已暂停，点击 ▶ 恢复（{_fmt_size(received)} / {_fmt_size(total)}）"
+        else:
+            text = f"已暂停，点击 ▶ 恢复（已下载 {_fmt_size(received)}）"
+        self.download_status.setText(text)
+
+    def _toggle_pause(self):
+        """暂停/恢复切换：下载中→暂停；已暂停→恢复。"""
+        if self.download_manager.is_running:
+            self.download_manager.pause()
+        else:
+            self.download_manager.resume()
+            self.pause_btn.setIcon(FIF.PAUSE)  # 恢复下载后切回"暂停"图标
+
+    def _cancel_download(self):
+        """取消下载（删除半成品文件）。"""
+        self.download_manager.cancel()
 
     def _open_download_folder(self):
         """在系统资源管理器中打开本次下载所在目录。"""

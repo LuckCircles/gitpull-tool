@@ -31,9 +31,8 @@ from PySide6.QtWidgets import (
 with contextlib.redirect_stdout(io.StringIO()):
     import qfluentwidgets.common.config  # noqa: F401
 
-from qfluentwidgets import Action
-from qfluentwidgets import FluentIcon as FIF
 from qfluentwidgets import (
+    Action,
     HorizontalSeparator,
     HyperlinkCard,
     InfoBar,
@@ -54,11 +53,13 @@ from qfluentwidgets import (
     ToolTipPosition,
     setTheme,
 )
+from qfluentwidgets import FluentIcon as FIF
 
 from app.config import load_config, save_config, save_repo_cache
 from app.token_store import TokenStore
 from core.git_service import GitService
-from core.proxy_validator import verify_proxy
+from core.proxy_validator import measure_git_latency, verify_proxy
+from core.release_service import extract_github_owner_repo, fetch_repo_info
 from core.repo_service import RepoService
 from core.scan_service import ScanService
 from core.token_validator import verify_token
@@ -68,9 +69,9 @@ from ui.dialogs.branch_dialog import BranchDialog
 from ui.dialogs.clone_dialog import CloneRepoDialog
 from ui.dialogs.delete_dialog import DeleteRepoDialog
 from ui.dialogs.release_dialog import ReleaseDialog
-from ui.widgets.history_page import HistoryWindow
 from ui.dialogs.rename_dialog import RenameRepoDialog
 from ui.widgets.dark_window import InputDialog, apply_tooltip
+from ui.widgets.history_page import HistoryWindow
 from utils.qt_executor import QFuture, TaskExecutor
 
 
@@ -114,7 +115,7 @@ class GitManager(MSFluentWindow):
     # repo, branch, local, remote_commit, status, ahead_behind, remote_url
     # 行号由 update_table_row 在主线程内根据 repo_path 查找，
     # 保证 load_repo_info 可安全在工作线程调用（不触碰任何控件）
-    update_row_signal = Signal(str, str, str, str, str, str, str)
+    update_row_signal = Signal(str, str, str, str, str, str, str, str)
     notify_signal = Signal(str, str, str)
     scan_summary_signal = Signal(
         int, int, int
@@ -147,6 +148,7 @@ class GitManager(MSFluentWindow):
         self._scan_ignored = 0
         self._proxy_verify_future: QFuture | None = None  # 运行中的代理验证任务
         self._token_verify_future: QFuture | None = None  # 运行中的令牌验证任务
+        self._speed_test_future: QFuture | None = None  # 运行中的测速任务
         self._history_window: HistoryWindow | None = None  # 版本历史弹出窗口（复用）
 
         self.init_ui()
@@ -198,7 +200,7 @@ class GitManager(MSFluentWindow):
             if saved_dir and os.path.isdir(saved_dir):
                 return saved_dir
         except Exception as e:
-            logger.warning(f"加载配置失败: {str(e)}")
+            logger.warning(f"加载配置失败: {e!s}")
 
         return default_dir
 
@@ -261,7 +263,7 @@ class GitManager(MSFluentWindow):
             self._config_cache["base_dir"] = self.base_dir
             self._save_cached_config()
         except Exception as e:
-            logger.warning(f"保存配置失败: {str(e)}")
+            logger.warning(f"保存配置失败: {e!s}")
 
     def init_ui(self):
         # MSFluentWindow：导航栏/标题栏/堆叠窗口均由基类内置
@@ -310,9 +312,9 @@ class GitManager(MSFluentWindow):
         repo_layout.addWidget(HorizontalSeparator())
 
         self.table = TableWidget()
-        self.table.setColumnCount(7)
+        self.table.setColumnCount(8)
         self.table.setHorizontalHeaderLabels(
-            ["", "仓库名称", "当前分支", "当前版本", "最新版本", "状态 / 同步", "操作"]
+            ["", "仓库名称", "星标", "当前分支", "当前版本", "最新版本", "状态 / 同步", "操作"]
         )
 
         header = self.table.horizontalHeader()
@@ -323,13 +325,15 @@ class GitManager(MSFluentWindow):
         header.setSectionResizeMode(4, QHeaderView.Fixed)
         header.setSectionResizeMode(5, QHeaderView.Fixed)
         header.setSectionResizeMode(6, QHeaderView.Fixed)
+        header.setSectionResizeMode(7, QHeaderView.Fixed)
 
         self.table.setColumnWidth(0, 36)
-        self.table.setColumnWidth(2, 140)
-        self.table.setColumnWidth(3, 120)
+        self.table.setColumnWidth(2, 72)
+        self.table.setColumnWidth(3, 140)
         self.table.setColumnWidth(4, 120)
-        self.table.setColumnWidth(5, 170)
-        self.table.setColumnWidth(6, 90)
+        self.table.setColumnWidth(5, 120)
+        self.table.setColumnWidth(6, 170)
+        self.table.setColumnWidth(7, 90)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.verticalHeader().setVisible(False)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -402,6 +406,17 @@ class GitManager(MSFluentWindow):
         )
         self.verify_proxy_card.clicked.connect(self.verify_proxy_settings)
         self.network_group.addSettingCard(self.verify_proxy_card)
+
+        # Git 连接测速卡片
+        self.speed_card = PushSettingCard(
+            "开始测速",
+            FIF.SPEED_HIGH,
+            "Git 连接测速",
+            "测量与 GitHub 的 Git 连接延迟（3 次采样取最快/平均）",
+            self.network_group,
+        )
+        self.speed_card.clicked.connect(self.test_git_speed)
+        self.network_group.addSettingCard(self.speed_card)
 
         self.token_card = PushSettingCard(
             "点击编辑",
@@ -646,6 +661,8 @@ class GitManager(MSFluentWindow):
                     item.setData(Qt.UserRole, candidate.path)
                 else:
                     item = QTableWidgetItem("...")
+                    if c in (2, 5, 6):  # 星标 / 最新版本 / 状态同步列只读
+                        item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
                 self.table.setItem(row, c, item)
             self._add_update_button(row, candidate.path)
 
@@ -752,7 +769,7 @@ class GitManager(MSFluentWindow):
         apply_tooltip(btn, "更新该仓库", position=ToolTipPosition.BOTTOM)
         btn.clicked.connect(lambda: self.update_single_repo(repo_path))
         self.table.takeItem(row, 6)
-        self.table.setCellWidget(row, 6, btn)
+        self.table.setCellWidget(row, 7, btn)
         return btn
 
     def _add_repo_row(self, repo_path: str):
@@ -772,6 +789,8 @@ class GitManager(MSFluentWindow):
                 item.setData(Qt.UserRole, repo_path)
             else:
                 item = QTableWidgetItem("...")
+                if c in (2, 5, 6):  # 星标 / 最新版本 / 状态同步列只读
+                    item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.table.setItem(row, c, item)
         self._add_update_button(row, repo_path)
         # 撤销搜索过滤确保新行可见
@@ -1042,7 +1061,7 @@ class GitManager(MSFluentWindow):
                     "失败", (result["error"] or "删除失败")[:150], parent=self
                 )
         except Exception as e:
-            logger.error(f"删除仓库失败: {str(e)}")
+            logger.error(f"删除仓库失败: {e!s}")
             InfoBar.error("失败", str(e)[:150], parent=self)
 
     def _context_rename_repo(self, repo_path: str):
@@ -1110,7 +1129,7 @@ class GitManager(MSFluentWindow):
             self._save_cached_config()
             InfoBar.success("成功", f"已重命名为 '{new_name}'", parent=self)
         except Exception as e:
-            logger.error(f"重命名仓库失败: {str(e)}")
+            logger.error(f"重命名仓库失败: {e!s}")
             InfoBar.error("失败", str(e)[:150], parent=self)
 
     def verify_proxy_settings(self):
@@ -1139,6 +1158,33 @@ class GitManager(MSFluentWindow):
         else:
             InfoBar.error("验证失败", message[:150], parent=self)
             logger.error(f"代理验证失败: {message}")
+
+    def test_git_speed(self):
+        """测量 Git 连接速度（线程池执行，不阻塞 UI）"""
+        # 上一次测速仍在进行 → 忽略重复点击
+        if self._speed_test_future and not self._speed_test_future.isFinished():
+            InfoBar.info("提示", "正在测速中，请稍候...", parent=self)
+            return
+
+        # 启用代理时经代理测速（与实际 fetch/pull 走同一条链路）
+        proxy = self.load_proxy() if self.proxy_switch.isChecked() else None
+        self.speed_card.setContent("测速中...")
+        self._speed_test_future = TaskExecutor.run(measure_git_latency, proxy).then(
+            on_success=lambda result: self._on_speed_test_finished(*result),
+            on_failed=lambda message: self._on_speed_test_finished(False, message),
+        )
+
+    def _on_speed_test_finished(self, success: bool, message: str):
+        """测速完成回调（主线程）"""
+        self._speed_test_future = None
+        if success:
+            self.speed_card.setContent(message)
+            InfoBar.success("测速完成", message, parent=self)
+            logger.success(f"Git 连接测速: {message}")
+        else:
+            self.speed_card.setContent("测速失败")
+            InfoBar.error("测速失败", message[:150], parent=self)
+            logger.error(f"Git 连接测速失败: {message}")
 
     def verify_token_settings(self):
         """验证访问令牌可用性（线程池执行，不阻塞 UI）"""
@@ -1180,7 +1226,7 @@ class GitManager(MSFluentWindow):
         """加载仓库信息（线程安全：可在工作线程调用）——阶段1：本地信息先行。
 
         只做本地 git 读取（分支/版本/远端地址，毫秒级、无网络），立即回传，
-        状态列显示 "⏳ 同步中"。阶段2（fetch 远端）作为独立任务提交，
+        状态列显示 "⏳ 同步中"。阶段2（fetch 远端 + GitHub stars）作为独立任务提交，
         避免慢速 fetch 阻塞其他仓库的阶段1 展示。
         行号由 update_table_row 在主线程内根据 repo_path 查找。
 
@@ -1195,6 +1241,7 @@ class GitManager(MSFluentWindow):
                 status = self.git_service.inspect_repository(
                     repo_path, ignored=ignored, assume_fresh=True
                 )
+                stars = self._fetch_stars_safe(status.remote_url)
                 self.update_row_signal.emit(
                     repo_path,
                     status.branch,
@@ -1203,6 +1250,7 @@ class GitManager(MSFluentWindow):
                     status.status,
                     status.ahead_behind,
                     status.remote_url,
+                    stars,
                 )
                 if generation is not None:
                     self._mark_scan_progress(
@@ -1213,6 +1261,7 @@ class GitManager(MSFluentWindow):
             local = self.git_service.inspect_repository(
                 repo_path, ignored=ignored, fetch=False
             )
+            # 阶段1：stars 显示 "..." 加载中
             self.update_row_signal.emit(
                 repo_path,
                 local.branch,
@@ -1221,31 +1270,75 @@ class GitManager(MSFluentWindow):
                 local.status,
                 local.ahead_behind,
                 local.remote_url,
+                "...",
             )
 
             if local.ignored:
                 # 忽略更新的仓库：本地信息即最终结果，无需 fetch
+                stars = self._fetch_stars_safe(local.remote_url)
+                self.update_row_signal.emit(
+                    repo_path,
+                    local.branch,
+                    local.local_commit,
+                    local.remote_commit,
+                    local.status,
+                    local.ahead_behind,
+                    local.remote_url,
+                    stars,
+                )
                 if generation is not None:
                     self._mark_scan_progress(generation, False, True)
             else:
                 # 阶段2 独立提交：所有仓库的阶段1 先行完成，fetch 再排队
                 TaskExecutor.run(self._sync_repo_info, repo_path, generation)
         except Exception as e:
-            logger.error(f"加载失败 {repo_path}: {str(e)}")
+            logger.error(f"加载失败 {repo_path}: {e!s}")
             self.update_row_signal.emit(
-                repo_path, "N/A", "错误", "N/A", "错误", "N/A", ""
+                repo_path, "N/A", "错误", "N/A", "错误", "N/A", "", "-"
             )
             if generation is not None:
                 self._mark_scan_progress(generation, False, False)
 
+    def _fetch_stars_safe(self, remote_url: str) -> str:
+        """安全获取 stars 数（非 GitHub / 网络失败均返回 "-"）。
+
+        在后台线程调用；token/proxy 开关尚未初始化时安全降级。
+        """
+        owner_repo = extract_github_owner_repo(remote_url)
+        if not owner_repo:
+            return "-"
+        owner, repo = owner_repo
+        token = self.load_token() or None
+        proxy = self.load_proxy() if getattr(self, "proxy_switch", None) and self.proxy_switch.isChecked() else None
+        stars, err = fetch_repo_info(owner, repo, token, proxy)
+        if err:
+            logger.debug(f"[Stars] {owner}/{repo}: {err}")
+            return "-"
+        return self._fmt_stars(stars)
+
+    @staticmethod
+    def _fmt_stars(stars: int) -> str:
+        """格式化 stars 数：123→123, 1234→1.2k, 10000→10k, 1234567→1.2M"""
+        if stars < 1000:
+            return str(stars)
+        if stars < 1_000_000:
+            k = stars / 1000
+            # 999999 → "1000k" 边界：>= 999500 直接用 M
+            if stars >= 999_500:
+                return f"{stars / 1_000_000:.1f}M"
+            return f"{k:.1f}k" if stars < 10_000 else f"{k:.0f}k"
+        m = stars / 1_000_000
+        return f"{m:.1f}M" if stars < 10_000_000 else f"{m:.0f}M"
+
     def _sync_repo_info(self, repo_path: str, generation: int | None = None):
-        """阶段2：fetch 远端后填充最终同步状态（线程安全）。"""
+        """阶段2：fetch 远端 + 并发请求 stars，填充最终状态（线程安全）。"""
         repo_path = os.path.abspath(repo_path)
 
         need_update = False
         try:
             repo_status = self.git_service.inspect_repository(repo_path)
             need_update = repo_status.need_update
+            stars = self._fetch_stars_safe(repo_status.remote_url)
             self.update_row_signal.emit(
                 repo_path,
                 repo_status.branch,
@@ -1254,11 +1347,12 @@ class GitManager(MSFluentWindow):
                 repo_status.status,
                 repo_status.ahead_behind,
                 repo_status.remote_url,
+                stars,
             )
         except Exception as e:
-            logger.error(f"同步状态失败 {repo_path}: {str(e)}")
+            logger.error(f"同步状态失败 {repo_path}: {e!s}")
             self.update_row_signal.emit(
-                repo_path, "N/A", "错误", "N/A", "错误", "N/A", ""
+                repo_path, "N/A", "错误", "N/A", "错误", "N/A", "", "-"
             )
         finally:
             if generation is not None:
@@ -1273,6 +1367,7 @@ class GitManager(MSFluentWindow):
         status: str,
         ahead_behind: str,
         remote_url: str = "",
+        stars: str = "",
     ):
         row = self.get_row_by_repo_path(repo)
         if row == -1:
@@ -1301,6 +1396,14 @@ class GitManager(MSFluentWindow):
         repo_item.setData(Qt.UserRole, repo)
         self.table.setItem(row, 1, repo_item)
 
+        # 星标列（列 2，只读）
+        stars_item = QTableWidgetItem(stars or "-")
+        stars_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        stars_item.setTextAlignment(Qt.AlignCenter)
+        if stars and stars != "..." and stars != "-":
+            stars_item.setForeground(QColor("#ffcc66"))  # GitHub 星标金色
+        self.table.setItem(row, 2, stars_item)
+
         status_text = (
             f"{status}  {ahead_behind}"
             if ahead_behind not in ("N/A", "✓", "-")
@@ -1308,11 +1411,13 @@ class GitManager(MSFluentWindow):
         )
         for col, text in enumerate([branch, local, remote_commit, status_text]):
             item = QTableWidgetItem(text)
+            if col >= 2:  # 最新版本 / 状态同步列只读（表格列 5、6）
+                item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             item.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(row, col + 2, item)
+            self.table.setItem(row, col + 3, item)
 
         # 状态颜色
-        status_item = self.table.item(row, 5)
+        status_item = self.table.item(row, 6)
         if status == "可更新":
             status_item.setForeground(QColor("#ff9800"))
         elif status == "✓ 已同步":
@@ -1323,7 +1428,7 @@ class GitManager(MSFluentWindow):
         # 按钮状态控制
         # 注意：不要用 setStyleSheet 覆盖（会破坏 Fluent 暗色样式表），
         # qfluentwidgets 控件自带正确的禁用态灰显
-        btn = self.table.cellWidget(row, 6)
+        btn = self.table.cellWidget(row, 7)
         if btn:
             btn.setEnabled(is_updatable)
 
@@ -1374,9 +1479,9 @@ class GitManager(MSFluentWindow):
         repo_item = self.table.item(row, 1)
         repo = repo_item.data(Qt.UserRole) if repo_item else ""
 
-        if col == 2:  # 当前分支 → 分支管理
+        if col == 3:  # 当前分支 → 分支管理
             BranchDialog(repo, self).exec()
-        elif col == 3:  # 当前版本 → 版本历史页面
+        elif col == 4:  # 当前版本 → 版本历史页面
             self.show_history_page(repo)
 
     def show_history_page(self, repo: str):
