@@ -7,11 +7,66 @@ lifecycle or invoke global Git configuration commands directly.
 from __future__ import annotations
 
 import os
+import re
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 
+from loguru import logger
+
 from core.git_runner import GitRunner
+
+# 远端仓库已删除的 git 报错特征（覆盖 HTTPS 与 SSH 两种传输、GitHub/Gitee 等）：
+#   HTTPS: fatal: repository 'https://...' not found
+#          fatal: unable to access '...': The requested URL returned error: 404
+#   SSH:   ERROR: Repository not found.
+# 注意：刻意不匹配 "Could not read from remote repository"（网络断开/密钥问题
+# 也会出现，会造成误判）；404 是删库/私有不可见的确切信号
+_REMOTE_DELETED_PAT = re.compile(
+    r"repository\s+'[^']*'\s+not\s+found"
+    r"|repository\s+not\s+found"
+    r"|returned\s+error:\s*404",
+    re.IGNORECASE,
+)
+
+
+def is_remote_deleted(stderr: str) -> bool:
+    """判断 fetch 的 stderr 是否表明远端仓库已被删除。"""
+    return bool(stderr) and bool(_REMOTE_DELETED_PAT.search(stderr))
+
+
+# Windows schannel（git 默认 TLS 后端）与代理不兼容时的握手失败特征：
+#   schannel: failed to receive handshake, SSL/TLS connection failed
+#   schannel: next InitializeSecurityContext failed: CRYPT_E_REVOCATION_OFFLINE
+#   OpenSSL SSL_read: ... tlsv1 alert ...
+# 这类失败与网络无关、重试无效，换 openssl 后端或直连即可恢复
+_TLS_HANDSHAKE_PAT = re.compile(
+    r"schannel:\s*(?:failed to receive handshake|next InitializeSecurityContext failed"
+    r"|security package|unable to complete handshake)"
+    r"|SSL/TLS connection failed"
+    r"|CRYPTO_E_REVOCATION_OFFLINE"
+    r"|certificate revocation (?:check|status) (?:failed|offline)",
+    re.IGNORECASE,
+)
+
+_TLS_HINT = (
+    "当前 git 使用 Windows schannel TLS 后端，与代理不兼容导致握手失败"
+    "（重试无效）。解决方式二选一："
+    "① 在设置页关闭「代理」开关，改用直连；"
+    "② 改用 openssl 后端：执行 git config --global http.sslBackend openssl"
+)
+
+
+def tls_backend_hint(stderr: str) -> str:
+    """识别 schannel TLS 后端与代理不兼容的握手失败，返回可操作提示；否则返回空串。"""
+    return _TLS_HINT if stderr and _TLS_HANDSHAKE_PAT.search(stderr) else ""
+
+
+# 本地领先远端的提交数达到该阈值时，判定远端历史疑似被删库重写/强制回退。
+# 本工具管理的仓库均为克隆所得，正常情况下本地不应大量领先远端；
+# 领先数十个提交通常意味着远端被 force-push 截断或删库重建
+# （如远端只剩 README，本地仍保留完整历史）
+AHEAD_DELETION_THRESHOLD = 20
 
 
 @dataclass(frozen=True)
@@ -135,10 +190,33 @@ class GitService:
             )
 
         # fetch 持仓库锁，与更新(pull)串行化，避免并发写 .git 产生 lock 冲突；
-        # assume_fresh（刚克隆完成）不 fetch，也无需持锁
+        # --prune 同步清除远端已删除分支的跟踪引用，使 @{u} 如实反映远端状态
+        # （VS Code 的默认 fetch 行为）；assume_fresh（刚克隆完成）不 fetch，也无需持锁
         if not assume_fresh:
             with self.repo_lock(repo_abs):
-                self.run_git(repo_abs, ["fetch", "--quiet"])
+                _, fetch_err, fetch_rc = self.run_git(
+                    repo_abs, ["fetch", "--quiet", "--prune"]
+                )
+            # fetch 失败时识别“远端仓库已删除”的确切特征（404 / not found）；
+            # 网络超时/密钥问题等其他失败保持原行为（基于旧远端引用继续计算）
+            if fetch_rc != 0:
+                # schannel 与代理不兼容：状态仍按旧引用计算，但必须让用户看见，
+                # 否则表现为「扫描一切正常、点更新却失败」，极难自行定位
+                tls_hint = tls_backend_hint(fetch_err)
+                if tls_hint:
+                    logger.warning(f"[fetch] {os.path.basename(repo_abs)}: {tls_hint}")
+            if fetch_rc != 0 and is_remote_deleted(fetch_err):
+                return RepoStatus(
+                    repo_abs,
+                    branch,
+                    local_commit or "N/A",
+                    "N/A",
+                    "远端已删除",
+                    "N/A",
+                    remote_url or "",
+                    False,
+                    False,
+                )
         ahead, _, _ = self.run_git(repo_abs, ["rev-list", "--count", "HEAD", "^@{u}"])
         behind, _, _ = self.run_git(repo_abs, ["rev-list", "--count", "@{u}", "^HEAD"])
         remote_commit, _, return_code = self.run_git(
@@ -148,9 +226,23 @@ class GitService:
         behind_count = int(behind) if behind.isdigit() else 0
 
         if return_code != 0:
-            status, ahead_behind, need_update = "错误", "N/A", False
+            # @{u} 无法解析：若分支配置过上游（branch.X.merge 存在）但跟踪引用
+            # 已被 --prune 清除，说明远端删除了该分支；从未配置上游则保持“错误”
+            merge_ref, _, merge_rc = self.run_git(
+                repo_abs, ["config", "--get", f"branch.{branch}.merge"]
+            )
+            if merge_rc == 0 and merge_ref.strip():
+                status, ahead_behind, need_update = "远端分支已删除", "N/A", False
+            else:
+                status, ahead_behind, need_update = "错误", "N/A", False
         elif ahead_count == 0 and behind_count == 0:
             status, ahead_behind, need_update = "✓ 已同步", "✓", False
+        elif ahead_count >= AHEAD_DELETION_THRESHOLD:
+            # 本地大量领先远端：远端历史疑似被删库重写/强制回退
+            # （远端只剩 README 等场景），按删库处理，不参与更新
+            status = "疑似远端删库"
+            ahead_behind = f"↑{ahead_count} ↓{behind_count}"
+            need_update = False
         else:
             status = "可更新"
             ahead_behind = f"↑{ahead_count} ↓{behind_count}"

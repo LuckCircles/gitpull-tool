@@ -8,8 +8,13 @@ dependencies = [
     "black",
     "loguru",
     "markdown",
-    "nuitka",
+    "nuitka==4.2.2",
     "pyside6-fluent-widgets",
     "python-checkup",
     "zstandard",
+]
+[tool.uv]
+override-dependencies = [
+    "pyside6-pdf; sys_platform == 'never'",
+    "pyside6-webengine; sys_platform == 'never'",
 ]

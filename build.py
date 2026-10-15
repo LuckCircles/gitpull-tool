@@ -1,6 +1,8 @@
 import os
+import shutil
 import subprocess
 import sys
+import time
 
 os.chdir(os.path.dirname(os.path.abspath(sys.argv[0])))
 
@@ -8,7 +10,58 @@ OUTPUT_DIR = "releases"
 OUTPUT_NAME = "GitPull-tool"
 
 
+def _rmtree_with_retry(path: str, max_retries: int = 5, interval: float = 1.0) -> bool:
+    """Windows 下带重试的目录删除（处理文件被占用导致的 WinError 32）。"""
+    if not os.path.exists(path):
+        return True
+    for attempt in range(1, max_retries + 1):
+        try:
+            shutil.rmtree(path)
+            return True
+        except PermissionError as e:
+            if attempt == max_retries:
+                print(f"无法删除 {path}（已重试 {max_retries} 次）: {e}")
+                return False
+            print(f"删除失败（第 {attempt} 次，{e}），{interval}s 后重试...")
+            time.sleep(interval)
+    return False
+
+
+def _cleanup_stale_artifacts() -> bool:
+    """打包前清理上一次残留的 build/dist/exe，避免 WinError 32 导致 Nuitka 崩溃。"""
+    stale_dirs = [
+        os.path.join(OUTPUT_DIR, "main.build"),
+        os.path.join(OUTPUT_DIR, "main.dist"),
+        os.path.join(OUTPUT_DIR, f"{OUTPUT_NAME}.build"),
+        os.path.join(OUTPUT_DIR, f"{OUTPUT_NAME}.dist"),
+    ]
+    stale_file = os.path.join(OUTPUT_DIR, f"{OUTPUT_NAME}.exe")
+
+    ok = True
+    for d in stale_dirs:
+        if os.path.exists(d) and not _rmtree_with_retry(d):
+            ok = False
+
+    if os.path.exists(stale_file):
+        for attempt in range(1, 6):
+            try:
+                os.unlink(stale_file)
+                break
+            except PermissionError as e:
+                if attempt == 5:
+                    print(f"无法删除旧 exe: {e}")
+                    ok = False
+                else:
+                    time.sleep(1.0)
+
+    return ok
+
+
 def compile_with_nuitka():
+    # 打包前清理残留：Windows 下文件句柄释放有延迟，必须重试
+    if not _cleanup_stale_artifacts():
+        print("警告：部分残留文件无法清理，打包可能失败。建议关闭资源管理器预览后重试。")
+
     main_script = "main.py"
 
     command = [

@@ -96,5 +96,7 @@ class RepoTable(TableWidget):
             status_item.setForeground(QColor("#ff9800"))
         elif status == "✓ 已同步":
             status_item.setForeground(QColor("#00c853"))
+        elif status in ("远端已删除", "远端分支已删除", "疑似远端删库"):
+            status_item.setForeground(QColor("#f44336"))
         elif is_ignored:
             status_item.setForeground(QColor("#9e9e9e"))

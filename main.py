@@ -42,6 +42,7 @@ from qfluentwidgets import (
     PushButton,
     PushSettingCard,
     RoundMenu,
+    ScrollArea,
     SearchLineEdit,
     SettingCardGroup,
     StrongBodyLabel,
@@ -351,14 +352,18 @@ class GitManager(MSFluentWindow):
         self.log_text.setReadOnly(True)
         log_page_layout.addWidget(self.log_text, 1)
 
-        self.settings_page = QWidget()
+        # 设置页使用滚动区域：窗口高度不足时可滚动查看，
+        # 所有设置卡片（含最底部的「启用代理」开关）完整显示，不被裁剪
+        self.settings_page = ScrollArea()
         self.settings_page.setObjectName("settings_page")
-        settings_layout = QVBoxLayout(self.settings_page)
+        self.settings_page.setWidgetResizable(True)
+        settings_widget = QWidget()
+        settings_layout = QVBoxLayout(settings_widget)
         settings_layout.setContentsMargins(24, 20, 24, 20)
         settings_layout.setSpacing(20)
 
         # ========== 目录设置 ==========
-        self.dir_group = SettingCardGroup("存储目录", self.settings_page)
+        self.dir_group = SettingCardGroup("存储目录", settings_widget)
         self.dir_card = PushSettingCard(
             "选择目录",
             FIF.FOLDER,
@@ -383,7 +388,7 @@ class GitManager(MSFluentWindow):
         settings_layout.addWidget(self.dir_group)
 
         # ========== 网络设置 ==========
-        self.network_group = SettingCardGroup("网络设置", self.settings_page)
+        self.network_group = SettingCardGroup("网络设置", settings_widget)
 
         self.proxy_card = PushSettingCard(
             "点击编辑",
@@ -454,7 +459,7 @@ class GitManager(MSFluentWindow):
         settings_layout.addWidget(self.network_group)
 
         # ========== 关于 ==========
-        self.about_group = SettingCardGroup("关于", self.settings_page)
+        self.about_group = SettingCardGroup("关于", settings_widget)
         self.about_card = HyperlinkCard(
             "https://github.com/LuckCircles/gitpull-tool",
             "关于工具",
@@ -467,6 +472,10 @@ class GitManager(MSFluentWindow):
         settings_layout.addWidget(self.about_group)
 
         settings_layout.addStretch(1)
+
+        # 装载滚动容器（先 setWidget 再启用透明背景，容器样式才能同步设置）
+        self.settings_page.setWidget(settings_widget)
+        self.settings_page.enableTransparentBackground()
 
         self.init_layout()
 
@@ -604,6 +613,9 @@ class GitManager(MSFluentWindow):
             self.token_card.setContent(self._mask_token(new_token))
 
     def _on_proxy_toggle(self, checked: bool):
+        # 代理关闭时禁用代理设置卡片（置灰不可点击），开启时恢复
+        self.proxy_card.setEnabled(checked)
+        self.verify_proxy_card.setEnabled(checked)
         proxy = self.proxy_card.contentLabel.text().strip()
         if proxy == "未设置":
             proxy = ""
@@ -1422,6 +1434,8 @@ class GitManager(MSFluentWindow):
             status_item.setForeground(QColor("#ff9800"))
         elif status == "✓ 已同步":
             status_item.setForeground(QColor("#00c853"))
+        elif status in ("远端已删除", "远端分支已删除", "疑似远端删库"):
+            status_item.setForeground(QColor("#f44336"))
         elif is_ignored:
             status_item.setForeground(QColor("#9e9e9e"))
 

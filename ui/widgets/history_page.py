@@ -46,8 +46,6 @@ from core.git_runner import GitRunner
 from ui.widgets.dark_window import ConfirmDialog, MaskFadeGuardMixin, apply_tooltip
 from utils.qt_executor import QFuture, TaskExecutor
 
-LOG_LIMIT = 50
-
 # 蓝色：当前 HEAD 所在行
 CURRENT_COLOR = QColor(0, 120, 215, 40)
 # 橙色：仅存在于一侧的差异提交
@@ -217,16 +215,15 @@ def collect_history(repo_path: str) -> dict:
 
 
 def _git_log(repo_path: str, target: list[str]) -> list[dict]:
-    """执行 git log 并解析为提交列表。"""
+    """执行 git log 并解析为提交列表（加载全部提交，不设条数上限）。"""
     cmd = [
         "git",
         "log",
         *target,
         "--pretty=format:%H|%ad|%an|%s",
         "--date=format:%Y-%m-%d %H:%M",
-        f"-{LOG_LIMIT}",
     ]
-    result = _git(repo_path, cmd, timeout=20)
+    result = _git(repo_path, cmd, timeout=60)
 
     commits: list[dict] = []
     if result.returncode != 0:

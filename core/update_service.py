@@ -15,6 +15,10 @@
 4. 远端删库/归档预检验（pull 前执行，防损毁）：
    - fetch 失败且报 404 / Repository not found → 判定远端已删库，阻断
    - 游离 HEAD / 远端分支不存在 → 明确提示，阻断
+   - 本地与远端无共同祖先（merge-base 为空，远端历史被整体重写/
+     删库重建）→ 判定远端疑似删库，阻断
+   - 本地领先远端提交数 ≥ 阈值（远端历史被强制截断/重写的特征）
+     → 判定远端疑似删库，阻断
    - 远端分支最新提交仅剩 README/ARCHIVE 等说明文档（或空分支）
      → 判定远端已删库或归档，阻断本次更新以保护本地代码
 5. pull 持 per-repo 锁（见 GitService.repo_lock）与扫描 fetch 串行化；
@@ -35,7 +39,7 @@ from dataclasses import dataclass
 
 from loguru import logger
 
-from core.git_service import GitService
+from core.git_service import AHEAD_DELETION_THRESHOLD, GitService, tls_backend_hint
 
 # pull / fetch 超时（秒）：大仓库 rebase/autostash 较慢，
 # 超时会被强杀并残留 index.lock
@@ -73,6 +77,8 @@ class UpdateService:
         "this_repo_is_archived",
         "this_repo_is_deleted",
         "this_repo_has_been_archived",
+        "license",
+        "licence",
     }
 
     # 远端删库特征（404 / not found / 仓库不存在 / 无法读取远端）
@@ -82,6 +88,15 @@ class UpdateService:
         r"|repo\s+not\s+found"
         r"|does\s+not\s+appear\s+to\s+be"
         r"|could\s+not\s+read\s+from\s+remote\s+repository)",
+        re.IGNORECASE,
+    )
+
+    # 远端历史被整体重写/分支引用消失的 pull 失败特征（疑似删库重建）：
+    #   - refusing to merge unrelated histories（本地与远端无共同祖先）
+    #   - no such ref was fetched（配置合并的分支在远端已不存在）
+    _HISTORY_REWRITE_PATTERN = re.compile(
+        r"refusing\s+to\s+merge\s+unrelated\s+histories"
+        r"|no\s+such\s+ref\s+was\s+fetched",
         re.IGNORECASE,
     )
 
@@ -208,6 +223,7 @@ class UpdateService:
         返回非空字符串表示应阻断本次更新的原因；空字符串表示可以继续。
         - fetch 报 404 / Repository not found → 远端已删库
         - 游离 HEAD / 远端分支不存在 → 无法更新
+        - 本地与远端无共同祖先 / 本地大量领先远端 → 疑似删库重写，阻断
         - 远端分支最新提交仅剩说明文档或为空 → 疑似删库/归档，阻断
         - 其它 fetch 失败（网络抖动等）不阻断，交由 pull 的重试逻辑兜底
         """
@@ -247,6 +263,33 @@ class UpdateService:
                 "请确认远端仓库状态后再操作。"
             )
 
+        # 历史关联性检验：本地与远端无共同祖先（远端历史被整体重写，
+        # 常见于删库后重建/只剩说明文档）→ 提交信息差别过大，疑似删库，阻断
+        local_sha, _, lcode = self._git_service.run_git(
+            repo_abs, ["rev-parse", "--verify", "--quiet", "HEAD"]
+        )
+        if lcode == 0 and local_sha.strip():
+            base, _, bcode = self._git_service.run_git(
+                repo_abs, ["merge-base", local_sha.strip(), sha]
+            )
+            if bcode != 0 or not base.strip():
+                return (
+                    "本地与远端提交历史无共同祖先（远端历史疑似被整体重写或删库重建），"
+                    "已阻止本次更新以保护本地代码。若确认远端已重写，请手动处理。"
+                )
+
+        # 领先数检验：本地大量领先远端（正常克隆管理的仓库不应如此，
+        # 远端历史被强制截断/删库重写的典型特征）→ 疑似删库，阻断
+        ahead_out, _, _ = self._git_service.run_git(
+            repo_abs, ["rev-list", "--count", "HEAD", f"^{remote_ref}"]
+        )
+        ahead_n = int(ahead_out.strip()) if ahead_out.strip().isdigit() else 0
+        if ahead_n >= AHEAD_DELETION_THRESHOLD:
+            return (
+                f"本地领先远端 {ahead_n} 个提交（远端历史疑似被删库重写或强制回退），"
+                "已阻止本次更新以保护本地代码。若确认需要同步，请手动处理。"
+            )
+
         # 检验远端分支最新提交的内容是否只剩说明文档（删库/归档特征）
         out, _, code = self._git_service.run_git(
             repo_abs, ["ls-tree", "-r", "--name-only", sha]
@@ -282,6 +325,13 @@ class UpdateService:
         if not error:
             return False
         return bool(cls._REMOTE_GONE_PATTERN.search(error))
+
+    @classmethod
+    def _is_history_rewrite_error(cls, error: str) -> bool:
+        """错误信息是否表明远端历史被重写/分支结构已变更（疑似删库重建）。"""
+        if not error:
+            return False
+        return bool(cls._HISTORY_REWRITE_PATTERN.search(error))
 
     def _rollback_if_archived(
         self, repo_abs: str, before_sha: str, files_before: int
@@ -498,6 +548,18 @@ class UpdateService:
                 "远端仓库已删除或不可访问（404）。"
                 "若确认远端已删库，可删除本地仓库或设置忽略更新。"
             )
+
+        if UpdateService._is_history_rewrite_error(text):
+            return (
+                "远端仓库历史与本地差异过大（历史被重写或分支结构已变更），"
+                "疑似远端已删库/重建。已阻止更新以保护本地代码；"
+                "若确认需要同步，请手动处理。"
+            )
+
+        # schannel 与代理不兼容：重试无效，必须换 TLS 后端或走直连
+        tls_hint = tls_backend_hint(text)
+        if tls_hint:
+            return tls_hint
 
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         tail = " | ".join(lines[-3:]) if lines else text

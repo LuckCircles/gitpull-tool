@@ -51,7 +51,10 @@ def validate_token_format(token: str) -> Tuple[bool, str]:
 
 
 def _curl_json(
-    url: str, headers: list[str], proxy: str | None, timeout: int
+    url: str,
+    headers: list[str],
+    proxy: str | None,
+    timeout: int,
 ) -> Tuple[int, str]:
     """
     执行 curl 请求并返回 (HTTP 状态码, 响应体)
@@ -94,7 +97,9 @@ def _curl_json(
         return -1, "SSL/TLS 握手失败"
     if result.returncode != 0:
         err = result.stderr.strip()
-        return -1, f"请求失败: {err[:100] if err else f'错误代码 {result.returncode}'}"
+        return -1, (
+            f"请求失败: {err[:100] if err else f'错误代码 {result.returncode}'}"
+        )
 
     lines = result.stdout.strip().rsplit("\n", 1)
     if len(lines) != 2 or not lines[1].isdigit():
