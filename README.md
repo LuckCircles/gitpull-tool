@@ -32,22 +32,44 @@
 ## 项目结构
 
 ```
-├── main.py               # 主窗口（MSFluentWindow）与页面逻辑
-├── app/                  # 配置读写、仓库缓存、日志初始化
-├── core/                 # 业务核心（无 UI 依赖）
-│   ├── git_runner.py     #   git 进程执行与生命周期管理
-│   ├── git_service.py    #   Git 操作封装（状态检查、分支、重置）
-│   ├── update_service.py #   更新算法（预检验/重试/自愈/完整性检查）
-│   ├── scan_service.py   #   目录扫描
-│   ├── repo_service.py   #   仓库增删改名
-│   ├── clone_manager.py  #   克隆流程
-│   └── proxy_validator.py#   代理可用性验证
-├── ui/
-│   ├── widgets/          # 仓库表格、日志、设置页、版本历史等组件
-│   └── dialogs/          # 克隆/分支/删除/重命名等 Fluent 弹窗
-├── workers/              # 后台线程（克隆、代理验证）
-├── models/               # 数据模型
-└── utils/                # subprocess 工具（隐藏窗口执行等）
+├── main.py               # 薄入口：装配（日志/主题/补丁/窗口）
+└── app/                  # 应用包（五层结构，借鉴 Fluent-M3U8）
+    ├── common/           #   基础设施层
+    │   ├── config.py     #     配置读写、仓库缓存
+    │   ├── paths.py      #     数据目录定位与旧版数据迁移
+    │   ├── logging_setup.py #  日志初始化 + Qt 消息处理器
+    │   ├── token_store.py #   访问令牌安全存储（keyring / secrets）
+    │   ├── infobar_compat.py # qfluentwidgets InfoBarManager 缺陷修补
+    │   ├── token_validator.py # GitHub / Gitee 令牌验证
+    │   ├── proxy_validator.py # 代理可用性验证与 Git 测速
+    │   ├── subprocess_utils.py # subprocess 工具（隐藏窗口执行等）
+    │   ├── github_url_utils.py # GitHub URL 解析与规范化
+    │   ├── qt_executor.py #    Qt 线程池并发执行器（QFuture）
+    │   └── models.py     #     数据模型
+    ├── service/          #   业务服务层（无 UI 依赖）
+    │   ├── git_runner.py #     git 进程执行与生命周期管理
+    │   ├── git_service.py #    Git 操作封装（状态检查、分支、重置）
+    │   ├── update_service.py # 更新算法（预检验/重试/自愈/完整性检查）
+    │   ├── scan_service.py #   目录扫描
+    │   ├── repo_service.py #   仓库增删改名
+    │   ├── clone_manager.py #  克隆流程
+    │   ├── release_service.py # Release 信息获取
+    │   ├── repo_probe.py #     远端健康探针
+    │   ├── clone_worker.py #   克隆后台任务
+    │   └── release_worker.py # Release 下载后台任务（deno）
+    ├── components/       #   复用 UI 组件层
+    │   ├── dark_window.py #    弹窗基类（ConfirmDialog / InputDialog 等）
+    │   ├── history_page.py #   版本历史弹出窗口
+    │   ├── branch_dialog.py #  分支管理弹窗
+    │   ├── clone_dialog.py #   克隆弹窗
+    │   ├── delete_dialog.py #  删除弹窗
+    │   ├── rename_dialog.py #  重命名弹窗
+    │   └── release_dialog.py # Release 查看/下载弹窗
+    ├── view/             #   界面层
+    │   └── main_window.py #    主窗口（MSFluentWindow）与页面逻辑
+    └── resource/         #   资源层
+        ├── icon.ico      #     应用图标（res.qrc / res_rc.py 同目录生成）
+        └── tools/        #     内嵌工具（deno.exe + download.ts）
 ```
 
 ## 环境与运行

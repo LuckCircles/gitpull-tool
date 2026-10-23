@@ -82,15 +82,15 @@ def compile_with_nuitka():
         "--include-windows-runtime-dlls=yes",
         f"--main={main_script}",
         "--enable-plugins=pyside6",
-        "--windows-icon-from-ico=icon.ico",
+        "--windows-icon-from-ico=app/resource/icon.ico",
         "--onefile",
         # 单文件缓存解压目录：首次启动解压一次，后续启动复用
         # （否则每次启动都重新解压内嵌的 deno.exe，约 97MB）
         "--onefile-tempdir-spec={CACHE_DIR}/GitPull-tool",
-        # 内嵌 tools/（deno + 下载脚本）：exe 单文件即可分发，
-        # 运行时经 __compiled__.containing_dir/tools 定位（见 workers/release_worker.py）
-        "--include-data-files=tools/deno.exe=tools/deno.exe",
-        "--include-data-files=tools/download.ts=tools/download.ts",
+        # 内嵌 app/resource/tools/（deno + 下载脚本）：exe 单文件即可分发，
+        # 运行时经 __compiled__.containing_dir/app/resource/tools 定位（见 app/service/release_worker.py）
+        "--include-data-files=app/resource/tools/deno.exe=app/resource/tools/deno.exe",
+        "--include-data-files=app/resource/tools/download.ts=app/resource/tools/download.ts",
         # markdown 库的扩展经 entry points 动态导入，
         # 静态 follow-imports 收集不到，需整包包含（Release 说明渲染）
         "--include-package=markdown",
